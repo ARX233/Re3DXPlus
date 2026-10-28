@@ -1,5 +1,10 @@
 <p align="center"><img src="docs/logo.png" alt="Re3DX+" width="480"></p>
 
+<p align="center">
+  <a href="README.md"><img src="https://img.shields.io/badge/%E8%AF%AD%E8%A8%80-%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87-brightgreen?style=for-the-badge" alt="简体中文"></a>
+  <a href="README.en.md"><img src="https://img.shields.io/badge/Language-English-lightgrey?style=for-the-badge" alt="English"></a>
+</p>
+
 # Re3DX+：湾岸 MIDNIGHT MAXIMUM TUNE 3DX+ 非官方移植（iOS / Android）
 
 把街机《湾岸 MIDNIGHT MAXIMUM TUNE 3DX+》原生移植到旧款移动设备上的研究项目：
@@ -56,6 +61,8 @@ build.sh        iOS 构建（ipa / 直接部署到设备）
 build_android.sh  Android 构建（apk，不用 Gradle）
 prepare_*.sh    从原版数据转换声音、BGM、影片
 ```
+
+iOS 的系统代码是 Objective-C，能和 C 一起编译，所以直接放在 `src/` 里；iOS 的 Info.plist 由 `build.sh` 现写。Android 需要 Java 外壳和 manifest，所以单独有 `android/` 文件夹。
 
 ## 准备
 
