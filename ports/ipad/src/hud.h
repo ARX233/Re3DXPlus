@@ -126,6 +126,8 @@ void hud_white(const hud_state *h, float alpha);
 void hud_fade(const hud_state *h, float grey, float alpha);
 /* The race camera's view and projection (column-major), for the rival's mark over its car */
 void hud_rival_view(const float view[16], const float proj[16]);
+/* Port extension: player distance for all modes; -1 when not running or invalid. */
+int hud_finish_metres(int play_state, float remain);
 void hud_draw(const hud_state *h, const car_state *car, const car_input *in, float fps);
 
 enum { HUD_KEYS_TOP, HUD_KEYS_LEFT, HUD_KEYS_RIGHT, HUD_KEY_GROUPS };

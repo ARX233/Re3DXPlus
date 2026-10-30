@@ -103,6 +103,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
           catch (Exception optional) { android.util.Log.w("WMMT", "Optional cut-in asset unavailable", optional); }
           try { prepareCardPages(ext); }
           catch (Exception optional) { android.util.Log.w("WMMT", "Optional card pages unavailable", optional); }
+          try { prepareBackfire(ext); }
+          catch (Exception optional) { android.util.Log.w("WMMT", "Optional backfire assets unavailable", optional); }
           try { sidecar = CardResources.prepare(getAssets(), ext); }
           catch (Exception optional) { android.util.Log.w("WMMT", "Optional card resources unavailable", optional); }
         }
@@ -228,6 +230,95 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
       }
       if (!temp.renameTo(dest)) throw new IOException("Cannot publish card pages");
     } finally { if (temp.exists() && !temp.delete()) android.util.Log.w("WMMT", "Cannot remove card pages temporary file"); }
+  }
+
+  /* Publish an immutable, verified pair directory before atomically replacing its pointer.
+   * The pointer is exactly 64 lowercase hex bytes: SHA-256(WPK digest || BFX digest).
+   * Native must read the pointer once and validate it before constructing either path. Old
+   * versions are retained for concurrent readers. This is not a power-loss transaction. */
+  private void prepareBackfire(File ext) throws Exception {
+    final String[] names = { "backfire.wpk", "backfire.bfx" };
+    String[] assets = getAssets().list("");
+    if (assets == null) throw new IOException("Cannot list APK assets");
+    boolean[] present = new boolean[2];
+    for (String asset : assets)
+      for (int i = 0; i < names.length; i++) if (names[i].equals(asset)) present[i] = true;
+    if (!present[0] && !present[1]) return;
+    if (!present[0] || !present[1]) throw new IOException("Incomplete packaged backfire pair");
+
+    byte[][] expected = new byte[2][];
+    for (int i = 0; i < names.length; i++)
+      try (InputStream in = getAssets().open(names[i])) { expected[i] = cutinDigest(in); }
+    File dir = new File(ext, "wmmt-sidecars");
+    if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("Cannot create sidecar directory");
+    if (!dir.getCanonicalFile().equals(new File(ext.getCanonicalFile(), "wmmt-sidecars")))
+      throw new IOException("Unsafe backfire directory");
+    MessageDigest pairHash = MessageDigest.getInstance("SHA-256");
+    pairHash.update(expected[0]); pairHash.update(expected[1]);
+    StringBuilder hex = new StringBuilder();
+    for (byte b : pairHash.digest()) hex.append(String.format(java.util.Locale.ROOT, "%02x", b & 255));
+    String version = hex.toString();
+    File dest = new File(dir, "backfire-" + version);
+    if (!dest.getCanonicalFile().equals(new File(dir.getCanonicalFile(), dest.getName())))
+      throw new IOException("Unsafe backfire version directory");
+    File stage = null, pointerTemp = null;
+    try {
+      if (!dest.exists()) {
+        File candidate = new File(dir, ".backfire-stage-" + UUID.randomUUID());
+        if (!candidate.mkdir()) throw new IOException("Cannot create backfire staging directory");
+        stage = candidate;
+        for (int i = 0; i < names.length; i++) {
+          File file = new File(stage, names[i]);
+          MessageDigest sha = MessageDigest.getInstance("SHA-256");
+          byte[] buffer = new byte[65536]; long total = 0;
+          try (InputStream in = getAssets().open(names[i]); FileOutputStream out = new FileOutputStream(file)) {
+            int n; while ((n = in.read(buffer)) != -1) {
+              total += n;
+              if (total > CUTIN_LIMIT) throw new IOException("Backfire asset exceeds limit: " + names[i]);
+              sha.update(buffer, 0, n); out.write(buffer, 0, n);
+            }
+            out.getFD().sync();
+          }
+          if (!MessageDigest.isEqual(expected[i], sha.digest()))
+            throw new IOException("Backfire asset changed during copy: " + names[i]);
+        }
+        verifyBackfirePair(stage, names, expected);
+        if (!stage.renameTo(dest) && !dest.isDirectory())
+          throw new IOException("Cannot publish backfire directory");
+      }
+      verifyBackfirePair(dest, names, expected);
+      File pointer = new File(dir, "backfire-current");
+      if (!pointer.getCanonicalFile().equals(new File(dir.getCanonicalFile(), "backfire-current")))
+        throw new IOException("Unsafe backfire pointer");
+      pointerTemp = File.createTempFile(".backfire-current-", ".tmp", dir);
+      try (FileOutputStream out = new FileOutputStream(pointerTemp)) {
+        out.write(version.getBytes("US-ASCII")); out.getFD().sync();
+      }
+      if (!pointerTemp.renameTo(pointer)) throw new IOException("Cannot publish backfire pointer");
+    } finally {
+      if (pointerTemp != null && pointerTemp.exists() && !pointerTemp.delete())
+        android.util.Log.w("WMMT", "Cannot remove backfire pointer temporary file");
+      if (stage != null && stage.exists()) {
+        for (String name : names) {
+          File file = new File(stage, name);
+          if (file.exists() && !file.delete()) android.util.Log.w("WMMT", "Cannot remove backfire staging file");
+        }
+        if (!stage.delete()) android.util.Log.w("WMMT", "Cannot remove backfire staging directory");
+      }
+    }
+  }
+
+  private void verifyBackfirePair(File dir, String[] names, byte[][] expected) throws Exception {
+    if (!dir.isDirectory()) throw new IOException("Backfire version is not a directory");
+    for (int i = 0; i < names.length; i++) {
+      File file = new File(dir, names[i]);
+      if (!file.getCanonicalFile().equals(new File(dir.getCanonicalFile(), names[i])) || !file.isFile())
+        throw new IOException("Unsafe or missing backfire file: " + names[i]);
+      try (InputStream in = new FileInputStream(file)) {
+        if (!MessageDigest.isEqual(expected[i], cutinDigest(in)))
+          throw new IOException("Backfire verification failed: " + names[i]);
+      }
+    }
   }
 
   /* A missing asset explicitly opts out and preserves the adb-pushed legacy layout. */

@@ -158,8 +158,11 @@ void hud_input(hud_state *h, car_input *in) {
 /* ---- drawing ---- */
 
 static int navi_gl_init(void);
-static void navi_load(const char *path);
+static int navi_load(const char *path);
+static void navi_clear(void);
+static void navi_select(int city, int force);
 static char navi_dir[1024];
+static int navi_city = -1, navi_requested = -1;
 
 static GLuint prog, tex_prog;
 static GLint u_proj, u_color, u_tproj, u_tex, u_mul, u_add;
@@ -228,7 +231,7 @@ static float CLUSTER_X = 948; /* (+ EDGE: hud_wide) */
 static float CLUSTER_Y = 286; /* where the arcade's (560, 228) goes (hud_lift moves it) */
 
 static GLuint upload(const unsigned char *px, unsigned w, unsigned h) {
-  GLuint tex;
+  GLuint tex = 0;
   glGenTextures(1, &tex);
   glBindTexture(GL_TEXTURE_2D, tex);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -384,9 +387,12 @@ void hud_set_car(int pack, int night) {
 int hud_load(const char *data_dir) {
   char path[1024];
   meters_index(data_dir);
-  snprintf(navi_dir, sizeof navi_dir, "%s", data_dir);
-  snprintf(path, sizeof path, "%s/navi.bin", data_dir);
-  navi_load(path);
+  int dir_len = snprintf(navi_dir, sizeof navi_dir, "%s", data_dir);
+  if (dir_len < 0 || dir_len >= (int)sizeof navi_dir) {
+    navi_dir[0] = 0;
+    navi_requested = -1;
+    fprintf(stderr, "minimap: data directory path too long\n");
+  } else navi_select(0, 1);
   snprintf(path, sizeof path, "%s/hud.bin", data_dir);
   FILE *f = fopen(path, "rb");
   if (!f) return -1;
@@ -951,13 +957,14 @@ static void draw_records(void) {
  * it goes to next, blue grey (off) for the others. The car is car_icon's red arrow. ---- */
 #define NAVI_VERT 24 /* f32 pos[3], f32 uv[2], u8 rgba[4] */
 typedef struct { short area; unsigned char on, blend; unsigned vert, index, n_index; } navi_mesh;
-static struct {
+typedef struct {
   GLuint prog, tex[2], vbo, ibo;
   GLint u_mvp, u_tex;
   int n;
   navi_mesh *mesh;
   int lit[3], next; /* the areas shown orange, and the next area they were set for */
-} NAVI;
+} navi_state;
+static navi_state NAVI;
 static const float NAVI_ICON = 400; /* the arrow's half size (display units) */
 static const float NAVI_ICON_UV[4][2] = { { 0.0f, 0.5f }, { 0.34f, 0.5f }, { 0.0f, 1.0f }, { 0.34f, 1.0f } };
 #define NAVI_UNSET (-1000)
@@ -978,9 +985,20 @@ static int navi_gl_init(void) {
   return 0;
 }
 
-static void navi_load(const char *path) {
+static void navi_clear(void) {
+  if (NAVI.vbo) glDeleteBuffers(1, &NAVI.vbo);
+  if (NAVI.ibo) glDeleteBuffers(1, &NAVI.ibo);
+  glDeleteTextures(2, NAVI.tex);
+  NAVI.vbo = NAVI.ibo = NAVI.tex[0] = NAVI.tex[1] = 0;
+  free(NAVI.mesh); NAVI.mesh = NULL; NAVI.n = 0;
+  navi_warm[0] = navi_warm[1] = 0;
+  NAVI.next = NAVI_UNSET;
+  navi_city = -1;
+}
+
+static int navi_load(const char *path) {
   FILE *f = fopen(path, "rb");
-  if (!f) return;
+  if (!f) { fprintf(stderr, "minimap: cannot open %s\n", path); return 0; }
   fseek(f, 0, SEEK_END);
   long size = ftell(f);
   fseek(f, 0, SEEK_SET);
@@ -990,7 +1008,10 @@ static void navi_load(const char *path) {
   unsigned h[5] = { 0 };
   if (ok) memcpy(h, d + 4, sizeof h);
   size_t o = 24 + 4 * ((size_t)h[0] * h[1] + (size_t)h[2] * h[3]);
-  if (!ok || o > (size_t)size || !(NAVI.mesh = calloc(h[4], sizeof *NAVI.mesh))) { free(d); return; }
+  if (!ok || o > (size_t)size || !h[4] || !(NAVI.mesh = calloc(h[4], sizeof *NAVI.mesh))) {
+    fprintf(stderr, "minimap: invalid data or allocation failure: %s\n", path);
+    free(d); return 0;
+  }
   /* first the sizes, then everything into one vertex and one index buffer */
   size_t verts = 0, indices = 0, p = o;
   int n = 0;
@@ -1011,7 +1032,10 @@ static void navi_load(const char *path) {
     indices += ni;
   }
   unsigned char *vb = malloc(verts * NAVI_VERT), *ib = malloc(indices * 2);
-  if (vb && ib) {
+  ok = n > 0 && (unsigned)n == h[4] && vb && ib;
+  if (ok) {
+    /* Do not confuse earlier renderer errors with this upload. */
+    for (int j = 0; j < 16 && glGetError() != GL_NO_ERROR; ++j) {}
     p = o;
     for (int i = 0; i < n; ++i) {
       unsigned nv, ni;
@@ -1031,11 +1055,14 @@ static void navi_load(const char *path) {
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     NAVI.tex[0] = upload(d + 24, h[0], h[1]);
     NAVI.tex[1] = upload(d + 24 + 4 * (size_t)h[0] * h[1], h[2], h[3]);
-    NAVI.n = n;
+    ok = NAVI.vbo && NAVI.ibo && NAVI.tex[0] && NAVI.tex[1] && glGetError() == GL_NO_ERROR;
+    if (ok) NAVI.n = n;
   }
   free(vb);
   free(ib);
   free(d);
+  if (!ok) fprintf(stderr, "minimap: incomplete data, allocation or GL upload failure: %s\n", path);
+  return ok;
 }
 
 /* PowerVR leaves a texture's real upload to its first draw: the race's first frame drew every
@@ -1095,29 +1122,41 @@ static int navi_lit(int area) {
   return area == navi_area(NAVI.lit[0]) || area == navi_area(NAVI.lit[1]) || area == navi_area(NAVI.lit[2]);
 }
 
-void hud_set_city(int city) {
+static void navi_select(int city, int force) {
   static const char *const FILE_NAME[CAR_CITIES] = { "navi.bin", "navi_oosaka.bin", "navi_hakone.bin", "navi_nagoya.bin",
                                                      "navi_fukuoka.bin" };
-  static int now; /* hud_load's Tokyo */
-  if (city < 0 || city >= CAR_CITIES || city == now) return;
-  now = city;
-  if (NAVI.vbo) glDeleteBuffers(1, &NAVI.vbo);
-  if (NAVI.ibo) glDeleteBuffers(1, &NAVI.ibo);
-  glDeleteTextures(2, NAVI.tex);
-  NAVI.vbo = NAVI.ibo = NAVI.tex[0] = NAVI.tex[1] = 0;
-  free(NAVI.mesh);
-  NAVI.mesh = NULL;
-  NAVI.n = 0;
-  navi_warm[0] = navi_warm[1] = 0;
+  if (city < 0 || city >= CAR_CITIES) return;
+  navi_requested = city;
+  if (!force && city == navi_city) return;
+  if (!navi_dir[0]) { fprintf(stderr, "minimap: data directory unavailable\n"); return; }
   char path[1100];
-  snprintf(path, sizeof path, "%s/%s", navi_dir, FILE_NAME[city]);
-  navi_load(path);
+  int len = snprintf(path, sizeof path, "%s/%s", navi_dir, FILE_NAME[city]);
+  if (len < 0 || len >= (int)sizeof path) {
+    fprintf(stderr, "minimap: city %d path too long\n", city);
+    return;
+  }
+  /* Build into separate handles. A failed switch keeps the old resources, but
+   * navi_requested prevents drawing them for the wrong city. */
+  navi_state old = NAVI;
+  int old_city = force ? -1 : navi_city;
+  NAVI.vbo = NAVI.ibo = NAVI.tex[0] = NAVI.tex[1] = 0;
+  NAVI.mesh = NULL; NAVI.n = 0; NAVI.next = NAVI_UNSET;
+  if (!navi_load(path)) {
+    navi_clear();
+    NAVI = old; navi_city = old_city;
+    return;
+  }
+  navi_state loaded = NAVI;
+  NAVI = old; navi_clear();
+  NAVI = loaded; navi_city = city;
 }
+
+void hud_set_city(int city) { navi_select(city, 0); }
 
 /* The map in its window at (17, 113, 88, 82) of the arcade's GL viewport (y up), looking
  * down from 2000 over the car with its heading up, ortho -2000..2000 x -1200..2800. */
 static void draw_navi(const hud_state *h, const car_race *r) {
-  if (!NAVI.n) return;
+  if (!NAVI.n || navi_city < 0 || navi_city != navi_requested) return;
   if (NAVI.next != r->next_area) { /* clMiniMap::update */
     NAVI.lit[0] = NAVI.next == NAVI_UNSET ? NAVI_UNSET : NAVI.lit[1];
     NAVI.lit[1] = r->area;
@@ -2418,6 +2457,33 @@ static void draw_keys(const hud_state *h, float steer, int all_keys) {
   fill_rect(PAUSE.x + 27, PAUSE.y + 13, 6, 22);
 }
 
+/* Port extension: every race mode uses the player's distance only. The original
+ * gates modes 4/5/8 on the nearest competitor at 700m; this is not that rule.
+ * Frames 150/30 are steady authored frames, not an inferred animation clock:
+ * pause and race reset cannot leave a stale countdown. */
+int hud_finish_metres(int play_state, float remain) {
+  if (play_state != 2 || !isfinite(remain) || remain < 0.0f || remain > 700.0f) return -1;
+  return (int)remain;
+}
+
+static void draw_finish_remaining(const car_race *r) {
+  if (!r->remain_valid) return; /* raw upstream distance, before fmaxf sanitization */
+  int metres = hud_finish_metres(r->play_state, r->remain);
+  if (metres < 0) return;
+  int number = anm_find("cons_g_last_000m"), label = anm_find("cons_g_last_saigo");
+  if (number < 0 || label < 0 || anm_frames(number) <= 150 || anm_frames(label) <= 30) return;
+  int t[4] = {anm_sprite(0x10fc), anm_sprite(0x10fb), anm_sprite(0x10fa), anm_sprite(0x10ff)};
+  int digits[4] = {anm_sprite(0x268 + metres / 100), anm_sprite(0x268 + metres / 10 % 10),
+                   anm_sprite(0x268 + metres % 10), anm_sprite(0x272)};
+  anm_swap sw[4];
+  for (int i = 0; i < 4; ++i) {
+    if (t[i] < 0 || digits[i] < 0) return;
+    sw[i] = (anm_swap){t[i], digits[i]};
+  }
+  anm_draw(label, 30, 1);
+  anm_draw_ex(number, 150, 1, 0, 0, sw, 4);
+}
+
 void hud_draw(const hud_state *h, const car_state *car, const car_input *in, float fps) {
   glUseProgram(prog);
   mat4 proj = screen_ortho(h->screen_w, h->screen_h);
@@ -2477,6 +2543,7 @@ void hud_draw(const hud_state *h, const car_state *car, const car_input *in, flo
   if (consoles && ta_story && ten_level < 0) draw_story_info(car);
   if (consoles) draw_vs(car);
   draw_ten_banner(car);
+  draw_finish_remaining(&car->race);
   draw_countdown(car);
   draw_cutin();
   glDisable(GL_BLEND);

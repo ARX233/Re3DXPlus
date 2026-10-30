@@ -110,6 +110,7 @@ typedef struct {
   int music;       /* the menus play the entry music (0) until the mode select, then the select music (1) */
   int zone;        /* the time zone select's card, the race's map: 0 morning, 1 night */
   int zones;       /* the time zones there are maps for (the app sets it; 1: morning only) */
+  int story_day_select, story_zone, story_zones_saved, story_previous_zone, ta_zone; /* port extension: separate confirmed preferences */
   int slide;       /* frames left of the cards' slide over to the other time zone */
   int card_t;      /* frames since the card came to rest (its ring flashes once) */
   int ready;       /* the app sets it once the chosen map is loaded: the title page waits for it */

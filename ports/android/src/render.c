@@ -2444,8 +2444,8 @@ void wpk_draw_wheels(const wpk_scene *w, const mat4 *view_proj, const mat4 *mode
   p->draws = q.draws, p->triangles = q.triangles, p->new_chunks = q.new_chunks;
 }
 
-void wpk_draw(const wpk_scene *s, const mat4 *view_proj, const mat4 *model, const float *eye_local,
-              int pass, render_params *p) {
+static void wpk_draw_internal(const wpk_scene *s, const mat4 *view_proj, const mat4 *model, const float *eye_local,
+              int pass, render_params *p, int limited, uint32_t group) {
   const scene_prog *pr = &progs[pass == WPK_CUTOUT];
   mat4 mvp = mat4_mul(*view_proj, *model);
   lit_draw ld;
@@ -2481,8 +2481,11 @@ void wpk_draw(const wpk_scene *s, const mat4 *view_proj, const mat4 *model, cons
   uint32_t gloss_tex = 0, gloss_cube = 0;
   for (uint32_t c = 0; c < s->n_chunk; ++c) {
     const wpk_chunk *ch = &s->chunks[c];
+    if (ch->first > s->n_batch || ch->n > s->n_batch - ch->first) continue;
+    if (limited && ch->group != group) continue;
     float range;
-    int wheel = ch->group >= WPK_WHEEL && ch->group < WPK_WHEEL + 4 ? (int)(ch->group - WPK_WHEEL) : -1;
+    int wheel = limited ? -1 : ch->group >= WPK_WHEEL && ch->group < WPK_WHEEL + 4 ? (int)(ch->group - WPK_WHEEL) : -1;
+    if (limited) goto group_cull;
     if (ch->group >= WPK_CTIRE && ch->group < WPK_CTIRE + 4) {
       if (!p->wheel_custom) continue;
       wheel = (int)(ch->group - WPK_CTIRE);
@@ -2515,11 +2518,12 @@ void wpk_draw(const wpk_scene *s, const mat4 *view_proj, const mat4 *model, cons
       range = p->range[ch->group];
     } else {
       /* named objects (pack.py --objects) show only when asked for */
-      int obj = (int)(ch->group - WPK_GROUPS);
-      if (!p->object_visible || obj >= p->n_objects || !p->object_visible[obj]) continue;
+      uint32_t obj = ch->group - WPK_GROUPS;
+      if (!p->object_visible || p->n_objects <= 0 || obj >= (uint32_t)p->n_objects || !p->object_visible[obj]) continue;
       range = p->range[WPK_SHORT];
     }
     if (box_distance(ch->lo, ch->hi, eye_local) > range) continue;
+  group_cull:
     if (box_outside(&mvp, ch->lo, ch->hi)) continue;
     if ((wheel >= 0 && (p->wheels || p->wheel_drop != 0.0f)) || turned) {
       /* clCarDisp::update: the tyre node at (TireLocation x, the posture's y, z) turned by the
@@ -2686,6 +2690,13 @@ void wpk_draw(const wpk_scene *s, const mat4 *view_proj, const mat4 *model, cons
   if (s->two_sided) glEnable(GL_CULL_FACE);
 }
 
+void wpk_draw(const wpk_scene *s, const mat4 *vp, const mat4 *model, const float *eye, int pass, render_params *p) {
+  wpk_draw_internal(s, vp, model, eye, pass, p, 0, 0);
+}
+void wpk_draw_group(const wpk_scene *s, const mat4 *vp, const mat4 *model, const float *eye, int pass, render_params *p, uint32_t group) {
+  if (s && vp && model && eye && p && pass >= 0 && pass < WPK_PASSES) wpk_draw_internal(s, vp, model, eye, pass, p, 1, group);
+}
+
 /* ---- the overhead map (render_overhead) ---- */
 #define OVER_SIZE 256
 #define OVER_TAN 1.73f    /* its half angle's tangent: 60 degrees each way */
@@ -2786,8 +2797,8 @@ int render_overhead(const wpk_scene *const *s, int n, const mat4 *car, render_pa
     for (uint32_t c = 0; c < sc->n_chunk; ++c) {
       const wpk_chunk *ch = &sc->chunks[c];
       if (ch->group >= WPK_GROUPS) {
-        int obj = (int)(ch->group - WPK_GROUPS);
-        if (!p->object_visible || obj >= p->n_objects || !p->object_visible[obj]) continue;
+        uint32_t obj = ch->group - WPK_GROUPS;
+        if (!p->object_visible || p->n_objects <= 0 || obj >= (uint32_t)p->n_objects || !p->object_visible[obj]) continue;
       }
       if (ch->hi[1] < eye[1] || box_distance(ch->lo, ch->hi, eye) > far) continue;
       for (uint32_t b = ch->first; b < ch->first + ch->n; ++b) {

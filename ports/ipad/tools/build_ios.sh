@@ -18,7 +18,7 @@ project=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 missing=0
 for file in \
   src/main.m src/sound_ios.m src/app.c src/story_evidence.c src/render.c src/hud.c \
-  src/car.c src/collide.c src/sound.c src/anm.c src/menu.c src/lights.c src/spark.c \
+  src/car.c src/collide.c src/sound.c src/anm.c src/menu.c src/lights.c src/spark.c src/backfire.c src/backfire_wpk.c \
   src/net.c src/vs_host.c src/title.c src/gk_ios.m src/phys/rc_runtime.c src/phys/phys_rc.c \
   src/cardb.h src/carwheel.h src/rivaldb.h src/tendb.h src/storycity.h src/storymovie.h \
   src/storyinfo.h src/minicourse.h src/meterdb.h src/meterdb_v2.h src/meter_pack.h \
@@ -34,12 +34,14 @@ mkdir "$out" || { echo "Cannot create new output directory: $out" >&2; exit 1; }
 out=$(CDPATH= cd -- "$out" && pwd -P)
 printf 'BUILD_DIR=%s\n' "$out"
 cd "$project"
+# clamp the one unbounded section walk of the generated physics (idempotent)
+python3 tools/recomp/guard_sections.py src/phys/phys_rc.c
 "$clang" -arch arm64 -isysroot "$sdk" -miphoneos-version-min=16.0 -O2 -DRC_FPT=double \
   -ffp-contract=off -w -c src/phys/phys_rc.c -o "$out/phys_rc.o"
 "$clang" -arch arm64 -isysroot "$sdk" -miphoneos-version-min=16.0 -O2 -DRC_FPT=double \
   -std=gnu99 -Wall -Wno-unused-function \
   src/main.m src/sound_ios.m src/app.c src/story_evidence.c src/render.c src/hud.c \
-  src/car.c src/collide.c src/sound.c src/anm.c src/menu.c src/lights.c src/spark.c \
+  src/car.c src/collide.c src/sound.c src/anm.c src/menu.c src/lights.c src/spark.c src/backfire.c src/backfire_wpk.c \
   src/net.c src/vs_host.c src/title.c src/gk_ios.m src/phys/rc_runtime.c "$out/phys_rc.o" \
   -o "$out/WMMT" -framework UIKit -framework Foundation -framework OpenGLES -framework QuartzCore \
   -framework AVFoundation -framework AudioToolbox -framework CoreMedia -framework CoreMotion -framework GameKit -lz

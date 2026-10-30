@@ -51,6 +51,7 @@ ports/*/tools/weartexts.py
 *.jpg
 *.jpeg
 *.wpk
+*.bfx
 *.img
 *.bin
 *.wav

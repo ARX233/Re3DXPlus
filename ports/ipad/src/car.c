@@ -4,6 +4,8 @@
 #include "car.h"
 
 #include <math.h>
+#include <float.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -458,6 +460,12 @@ static void read_effect(car_effect *e) {
   e->spark = MF(P.eff + 0x68);
   memcpy(e->at, VA(P.eff + 0x6c), sizeof e->at);
   memcpy(e->dir, VA(P.eff + 0x78), sizeof e->dir);
+  e->backfire_pulse = (unsigned char)M8(P.eff + 0x84);
+  memcpy(e->backfire_vec, VA(P.eff + 0x30), sizeof e->backfire_vec);
+  double x = e->backfire_vec[0], y = e->backfire_vec[1], z = e->backfire_vec[2];
+  double length = sqrt(x*x + y*y + z*z);
+  e->backfire_type = isfinite(length) && length < (double)INT_MAX + 1.0
+                       ? (int)length % 2 : -1;
 }
 
 static void read_body(car_state *c) {
@@ -518,6 +526,10 @@ static void read_jct_blocks(car_state *c) {
  * to the goal) and S2DInfoMap (+0 area, +4 the next, +8 z, +0xc x in display units, +0x10
  * heading), as CSeq hands them to clStandardConsole and clMiniMap; the sections from the
  * CTimeKeeper the way clWorkSpace gets them for the section times. */
+/* Get2DInfoRace uses FLT_MAX as the unavailable sentinel. Check before fmaxf
+ * converts a negative or NaN distance to zero for the existing displays. */
+static int race_remain_valid(float mm) { return isfinite(mm) && mm >= 0.0f && mm < FLT_MAX; }
+
 static void read_race(car_race *r) {
   call(f_8983950, 1, P.info_race);
   call(f_8983874, 1, P.info_map);
@@ -529,7 +541,9 @@ static void read_race(car_race *r) {
   }
   r->countdown = MF(P.info_race);
   r->time_left = MF(P.info_race + 4);
-  r->remain = fmaxf(0.0f, MF(P.info_race + 0xc) * 0.001f);
+  float remain_mm = MF(P.info_race + 0xc);
+  r->remain_valid = race_remain_valid(remain_mm);
+  r->remain = fmaxf(0.0f, remain_mm * 0.001f);
   uint32_t st = M32(STATE);
   int was = r->state;
   r->play_state = (int)st;
@@ -696,6 +710,9 @@ static void read_rival(car_state *c) {
   for (int i = 0; i < CAR_RIVALS; ++i) {
     c->rival_shown[i] = (i < P.n_rival || i < P.vs_race || (P.ten_stage && i == 0)) && (call(f_8983488, 3, (uint32_t)i + 1u, P.disp, P.eff) & 0xff);
     c->rival_effect[i].spark = 0;
+    c->rival_effect[i].backfire_pulse = 0;
+    memset(c->rival_effect[i].backfire_vec, 0, sizeof c->rival_effect[i].backfire_vec);
+    c->rival_effect[i].backfire_type = -1;
     if (c->rival_shown[i]) {
       read_effect(&c->rival_effect[i]);
       memcpy(c->rival_body[i], VA(P.disp + 4), sizeof c->rival_body[i]);

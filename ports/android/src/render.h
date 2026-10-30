@@ -245,6 +245,8 @@ int wpk_warm_paints(wpk_scene *s, int budget);
  * pass: WPK_OPAQUE, WPK_CUTOUT or WPK_BLEND (the batches of that kind). */
 void wpk_draw(const wpk_scene *s, const mat4 *view_proj, const mat4 *model, const float *eye_local,
               int pass, render_params *p);
+/* Exact mesh group; model and eye are in the chunk's local coordinate system. */
+void wpk_draw_group(const wpk_scene *s, const mat4 *vp, const mat4 *model, const float *eye, int pass, render_params *p, uint32_t group);
 /* A dress-up wheel's pack (pack_cars.py --wheels: WHEEL_L in WPK_WHEEL, WHEEL_R in + 1, at
  * the hub) on the four corners of a car drawn with `model` (eye_local in the car's frame):
  * hub[axle] = the left hub's x and z, the scale across and in diameter (src/carwheel.h);

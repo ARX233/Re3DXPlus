@@ -43,6 +43,9 @@ else
 fi
 
 # the native library: the game as on iOS, with main_android.c for main.m and sound_ios.m
+# The generated physics is kept locally; clamp its one unbounded section walk each build
+# (idempotent, and a no-op once guarded) so an older copy cannot bring the crash back.
+if [ -f src/phys/phys_rc.c ]; then python3 tools/recomp/guard_sections.py src/phys/phys_rc.c; fi
 if [ ! -f "$OUT/obj/phys_rc.o" ] || [ src/phys/phys_rc.c -nt "$OUT/obj/phys_rc.o" ]; then
   echo "compiling the arcade physics (takes a minute)..."
   $CC -O2 -fPIC -ffp-contract=off -DRC_FPT=double -w -c src/phys/phys_rc.c -o "$OUT/obj/phys_rc.o"
@@ -50,7 +53,7 @@ fi
 $CC -O2 -fPIC -shared -std=gnu99 -Wall -Wno-unused-function -DRC_FPT=double -DWMMT_EGL $GFX \
   -mcpu=cortex-a73 \
   src/main_android.c src/app.c src/story_evidence.c src/render.c src/hud.c src/car.c src/collide.c src/sound.c src/anm.c src/menu.c \
-  src/lights.c src/spark.c src/net.c src/vs_host.c src/title.c src/gk.c \
+  src/lights.c src/spark.c src/backfire.c src/backfire_wpk.c src/net.c src/vs_host.c src/title.c src/gk.c \
   src/phys/rc_runtime.c "$OUT/obj/phys_rc.o" \
   -o "$OUT/apk/lib/arm64-v8a/libwmmt.so" \
   -landroid $GFX_LIBS -laaudio -llog -lz -lm -Wl,-z,max-page-size=16384
@@ -107,6 +110,16 @@ if [ -n "${CARD_PAGES_BIN:-}" ]; then
   mkdir -p "$OUT/apk/assets"
   cp "$CARD_PAGES_BIN" "$OUT/apk/assets/card-pages.bin"
   (cd "$OUT/apk" && zip -q -0 ../base.apk assets/card-pages.bin)
+fi
+# Optional backfire sidecars are a matched pair, never part of GAME_DATA_ZIP.
+if [ -n "${BACKFIRE_WPK:-}" ] || [ -n "${BACKFIRE_BFX:-}" ]; then
+  [ -n "${BACKFIRE_WPK:-}" ] && [ -n "${BACKFIRE_BFX:-}" ] &&
+    [ -f "$BACKFIRE_WPK" ] && [ -f "$BACKFIRE_BFX" ] || { echo 'BACKFIRE_WPK and BACKFIRE_BFX must both be existing files' >&2; exit 1; }
+  mkdir -p "$OUT/apk/assets"
+  [ ! -e "$OUT/apk/assets/backfire.wpk" ] && [ ! -e "$OUT/apk/assets/backfire.bfx" ] || { echo 'Backfire asset destination already exists' >&2; exit 1; }
+  cp "$BACKFIRE_WPK" "$OUT/apk/assets/backfire.wpk"
+  cp "$BACKFIRE_BFX" "$OUT/apk/assets/backfire.bfx"
+  (cd "$OUT/apk" && zip -q -0 ../base.apk assets/backfire.wpk assets/backfire.bfx)
 fi
 "$BT/zipalign" -f -P 16 4 "$OUT/base.apk" "$OUT/aligned.apk"
 [ ! -e "$APK_OUT" ] || { echo "Refusing to overwrite existing APK: $APK_OUT" >&2; exit 1; }

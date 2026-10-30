@@ -8,4 +8,6 @@ set -e
 cd "$(dirname "$0")"
 export WMMT_MAIN="${1:-../../../Wangan Midnight Maximum Tune 3DX+ (Japan)/main}"
 python3 recomp.py ../../src/phys/phys_rc.c $(cat roots.txt)
+# clamp the section-manager underflow inherited from the original code shape
+python3 guard_sections.py ../../src/phys/phys_rc.c
 python3 mkimage.py ../../data/phys.img

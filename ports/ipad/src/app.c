@@ -36,6 +36,8 @@
 #include "hud.h"
 #include "lights.h"
 #include "spark.h"
+#include "backfire.h"
+#include "backfire_wpk.h"
 #include "mathx.h"
 #include "menu.h"
 #include "card_choice_store.h"
@@ -344,6 +346,141 @@ static struct {
   int vs_song;      /* the host's: its song for everyone's race */
   int vs_closed;    /* a race's frames since the host closed the game (or went quiet): its notice */
 } G;
+
+
+/* Published backfire directories are immutable for this process. The path validator
+ * prevents accidental corrupt packs from reaching the legacy loader; it does not
+ * defend against an adversary replacing files between validation and loading. */
+static bfx_asset backfire_asset;
+static bfx_playback backfire_play;
+static wpk_scene backfire_scene;
+static int backfire_ready;
+static char backfire_body[BFX_MAX_CARS][BFX_NAME];
+
+static void backfire_reset(void) {
+  bfx_reset(&backfire_play);
+  memset(backfire_body, 0, sizeof backfire_body);
+}
+static int backfire_path(char *out, size_t cap, const char *dir, const char *name) {
+  int n = snprintf(out, cap, "%s/%s", dir, name);
+  return n >= 0 && (size_t)n < cap;
+}
+static int backfire_child(const char *root, const char *path) {
+  char r[4096], p[4096];
+  if (!realpath(root, r) || !realpath(path, p)) return 0;
+  size_t n = strlen(r);
+  return !strncmp(r, p, n) && p[n] == '/' && p[n+1];
+}
+static void backfire_open(const char *data_dir) {
+  char dir[4096], bfx[4096], wpk[4096];
+  backfire_reset();
+#ifdef __ANDROID__
+  char root[4096], sidecar[4096], marker[4096], id[65];
+  if (snprintf(root, sizeof root, "%s", data_dir) >= (int)sizeof root) return;
+  char *q = strrchr(root, '/');
+  if (q && !strcmp(q+1, "wmmt")) *q = 0;
+  else if (q) { *q = 0; q = strrchr(root, '/'); if (!q || strcmp(q+1, "re3dxplus-data")) return; *q = 0; }
+  else return;
+  if (!backfire_path(sidecar, sizeof sidecar, root, "wmmt-sidecars") ||
+      !backfire_child(root, sidecar) ||
+      !backfire_path(marker, sizeof marker, sidecar, "backfire-current") ||
+      !backfire_child(sidecar, marker)) return;
+  FILE *f = fopen(marker, "rb"); if (!f) return;
+  size_t count = fread(id, 1, 64, f); int extra = fgetc(f), bad = ferror(f); fclose(f);
+  if (count != 64 || extra != EOF || bad) return;
+  id[64] = 0;
+  for (int i = 0; i < 64; ++i) if (!((id[i] >= '0' && id[i] <= '9') || (id[i] >= 'a' && id[i] <= 'f'))) return;
+  int n = snprintf(dir, sizeof dir, "%s/backfire-%s", sidecar, id);
+  if (n < 0 || (size_t)n >= sizeof dir || !backfire_child(sidecar, dir)) return;
+#else
+  if (snprintf(dir, sizeof dir, "%s", data_dir) >= (int)sizeof dir) return;
+#endif
+  if (!backfire_path(bfx, sizeof bfx, dir, "backfire.bfx") ||
+      !backfire_path(wpk, sizeof wpk, dir, "backfire.wpk") ||
+      !backfire_child(dir, bfx) || !backfire_child(dir, wpk)) return;
+  if (bfx_load(&backfire_asset, bfx) != 0) return;
+  if (bfx_wpk_validate(wpk, &backfire_asset) != 0) { bfx_free(&backfire_asset); return; }
+  backfire_scene.fd = -1;
+  if (wpk_load(&backfire_scene, wpk) != 0) {
+    bfx_free(&backfire_asset); wpk_free(&backfire_scene); return;
+  }
+  backfire_scene.two_sided = 1;
+  backfire_ready = 1;
+}
+static int backfire_key(char *out, size_t cap, int pack, int aero) {
+  int n;
+  if (pack < 0 || pack >= NPACKS) return 0;
+  if (pack >= CARDB_NPACKS) n = snprintf(out, cap, "chara/%s", RIVALDB_CHARA[pack-CARDB_NPACKS]);
+  else if (aero >= 1 && aero <= 3) n = snprintf(out, cap, "cars/%s:aero_%c", CARDB_PACKS[pack], 'a'+aero-1);
+  else n = snprintf(out, cap, "cars/%s", CARDB_PACKS[pack]);
+  return n >= 0 && (size_t)n < cap;
+}
+static int backfire_rival_pack(int i) {
+  int t = G.car.race.ten_rival;
+  return i == 0 && G.n_ten && t >= 0 && t < G.n_ten ? G.ten_pack[t] : G.rival_pack[i];
+}
+static void backfire_tick_car(int slot, int pack, int aero, const car_effect *e) {
+  char key[BFX_NAME] = "";
+  if (!e || !backfire_key(key, sizeof key, pack, aero)) key[0] = 0;
+  if (strcmp(backfire_body[slot], key)) {
+    memset(backfire_play.frame[slot], -1, sizeof backfire_play.frame[slot]);
+    memset(backfire_play.type[slot], -1, sizeof backfire_play.type[slot]);
+    memcpy(backfire_body[slot], key, strlen(key)+1);
+  }
+  bfx_step(&backfire_play, &backfire_asset, slot, key, e ? e->backfire_pulse : 0, e ? e->backfire_type : -1);
+}
+static void backfire_tick(void) {
+  if (!backfire_ready) return;
+  backfire_tick_car(0, G.race_pack, G.aero_set, &G.car.effect);
+  for (int i = 0; i < CAR_RIVALS; ++i)
+    backfire_tick_car(i+1, backfire_rival_pack(i), G.vs_race ? G.rival_dress[i].aero : 0,
+                      G.car.rival_shown[i] ? &G.car.rival_effect[i] : NULL);
+}
+/* Invert the complete affine mesh transform: animated effect matrices may scale. */
+static int backfire_eye(const mat4 *m, const float *p, float *out) {
+  const float *a = m->m;
+  float x=p[0]-a[12], y=p[1]-a[13], z=p[2]-a[14];
+  float c00=a[5]*a[10]-a[9]*a[6], c01=a[8]*a[6]-a[4]*a[10], c02=a[4]*a[9]-a[8]*a[5];
+  float det=a[0]*c00+a[1]*c01+a[2]*c02;
+  if (!isfinite(det) || fabsf(det)<1e-12f || fabsf(a[3])+fabsf(a[7])+fabsf(a[11])>1e-6f || fabsf(a[15]-1)>1e-6f) return 0;
+  out[0]=(c00*x+c01*y+c02*z)/det;
+  out[1]=((a[9]*a[2]-a[1]*a[10])*x+(a[0]*a[10]-a[8]*a[2])*y+(a[8]*a[1]-a[0]*a[9])*z)/det;
+  out[2]=((a[1]*a[6]-a[5]*a[2])*x+(a[4]*a[2]-a[0]*a[6])*y+(a[0]*a[5]-a[4]*a[1])*z)/det;
+  return isfinite(out[0]) && isfinite(out[1]) && isfinite(out[2]);
+}
+static void backfire_draw_car(int slot, const float *body, const mat4 *vp, const float *eye, render_params *rp) {
+  mat4 car; memcpy(car.m, body, sizeof car.m);
+  for (unsigned i=0; i<backfire_asset.nnozzle; ++i) {
+    int frame=backfire_play.frame[slot][i], type=backfire_play.type[slot][i];
+    const bfx_nozzle *noz=&backfire_asset.nozzle[i];
+    int id=bfx_car_id(noz->car, backfire_body[slot]);
+    if (frame<0 || frame>=BFX_FRAMES || (type!=0 && type!=1) || id<0 || strcmp(noz->muffler,"MUFFLER1")) continue;
+    const char *variant = bfx_variant_b(id) ? (type ? "MIDDLE_B" : "SMALL_B") : (type ? "MIDDLE_A" : "SAMLL_A");
+    mat4 tr, scale=mat4_identity(); memcpy(tr.m,noz->matrix,sizeof tr.m);
+    scale.m[0]=scale.m[5]=scale.m[10]=0.5f;
+    mat4 base=mat4_mul(mat4_mul(car,tr),scale);
+    for (unsigned j=0; j<backfire_asset.nmesh; ++j) {
+      const bfx_mesh *mesh=&backfire_asset.mesh[j]; if (strcmp(mesh->variant,variant)) continue;
+      mat4 anim; memcpy(anim.m,mesh->frame[frame],sizeof anim.m);
+      mat4 model=mat4_mul(base,anim), mvp=mat4_mul(*vp,model); float local[3]; int finite=1;
+      for (int k=0;k<16;++k) finite &= isfinite(model.m[k]) && isfinite(mvp.m[k]);
+      for (int k=0;k<3;++k) finite &= isfinite(eye[k]);
+      if (finite && backfire_eye(&model,eye,local))
+        for (int pass=0; pass<WPK_PASSES; ++pass)
+          wpk_draw_group(&backfire_scene,vp,&model,local,pass,rp,mesh->group);
+    }
+  }
+}
+static void backfire_draw(const mat4 *vp, const float *eye, int movie) {
+  if (!backfire_ready || movie) return;
+  render_begin(&G.rp); render_blend_pass(1);
+  render_params p=G.rp; p.range[0]=p.range[1]=p.range[2]=1e9f; p.object_visible=NULL; p.n_objects=0;
+  if (G.camera==0) backfire_draw_car(0,G.car.body,vp,eye,&p);
+  for (int i=0;i<CAR_RIVALS;++i) if (G.car.rival_shown[i] && G.rival_model[i])
+    backfire_draw_car(i+1,G.car.rival_body[i],vp,eye,&p);
+  G.rp.draws=p.draws; G.rp.triangles=p.triangles; G.rp.new_chunks=p.new_chunks;
+  render_begin(&G.rp); render_blend_pass(1); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+}
 
 static void vs_ip_load(void);
 
@@ -1697,6 +1834,7 @@ int app_init(const char *data_dir, int fb_width, int fb_height, float screen_w, 
    * anisotropic filtering */
   if (G.console || G.ipad_graphics) render_aniso(16);
   snprintf(G.data_dir, sizeof G.data_dir, "%s", data_dir);
+  backfire_open(data_dir);
   if (!G.save_dir[0]) snprintf(G.save_dir, sizeof G.save_dir, "%s", data_dir);
   /* and the 3D multisampled in half floats, with a bloom over the lights (a file hq_off in
    * the data folder, or WMMT_NO_HQ, for the frame times without, to compare) */
@@ -1805,6 +1943,11 @@ int app_init(const char *data_dir, int fb_width, int fb_height, float screen_w, 
   card_choice_load();
   records_load();
   G.menu.zone = zone;
+  G.menu.ta_zone = zone;
+  snprintf(path, sizeof path, "%s/story_timezone", G.save_dir);
+  FILE *story_tz = fopen(path, "r");
+  G.menu.story_zone = story_tz ? fgetc(story_tz) == '1' : 0;
+  if (story_tz) fclose(story_tz);
   G.menu.zones = zones;
   G.race_model = &G.fd3s;
   G.rival = G.rival_env = -1;
@@ -2269,13 +2412,13 @@ static int ten_ta_course(void) { return TEN_TA_COURSE[menu_ten_course(&G.menu)];
  * title page, else a test's (WMMT_RIVAL) or none */
 static int story_rival(void) {
   if (G.menu.game == MENU_GAME_TEN && G.menu.screen == MENU_PRE) return TEN_FIRST;
-  if (G.menu.game != MENU_GAME_STORY || G.menu.screen != MENU_PRE || G.menu.story_pick < 0) return G.rival_env;
+  if (G.menu.game != MENU_GAME_STORY || (G.menu.screen != MENU_PRE && !G.menu.story_day_select) || G.menu.story_pick < 0) return G.rival_env;
   int pick = G.menu.story_pick;
 #ifdef WMMT_EGL
   if (getenv("WMMT_STORY_SEL")) pick = atoi(getenv("WMMT_STORY_SEL")); /* test: this story select */
 #endif
   for (int i = 0; i < RIVALDB_N; ++i)
-    if (RIVALDB[i].select == pick && RIVALDB[i].race == G.story_race && RIVALDB[i].slot == 0) return i;
+    if (RIVALDB[i].select == pick && RIVALDB[i].race == (G.menu.story_day_select ? 0 : G.story_race) && RIVALDB[i].slot == 0) return i;
   return G.rival_env;
 }
 
@@ -3001,7 +3144,7 @@ static void movie_open(int select, int race, const int *rows, int n_rows) {
   if (len <= 1.0f) { /* its trails missing: the race at once */
     car_set_rivals(G.race_rv, G.race_nrv);
     car_start(&G.car, G.race_course, G.menu.manual, &G.race_spec);
-    spark_reset();
+    spark_reset(); backfire_reset();
     return;
   }
   G.movie_len = len;
@@ -3019,7 +3162,7 @@ static void movie_close(void) {
   G.movie_len = 0;
   car_set_rivals(G.race_rv, G.race_nrv);
   if (car_start(&G.car, G.race_course, G.menu.manual, &G.race_spec) != 0) fprintf(stderr, "race after the movie failed to start\n");
-  spark_reset();
+  spark_reset(); backfire_reset();
   G.movie_in = G.movie_fade ? MOVIE_FADE : 0;
   G.race_frames = 0;
   G.time_shown = (int)G.car.race.time_left;
@@ -3713,8 +3856,14 @@ static void menu_frame(float dt, double frame_start) {
     if (G.menu.vs.area_final >= 0 || G.menu.vs.me == G.menu.vs.host) city = car_course_city(G.menu.course);
   } else if (G.menu.game == MENU_GAME_STORY) {
     int r = story_rival();
-    if (G.menu.screen == MENU_PRE && r >= 0 && RIVALDB[r].series >= 0 && RIVALDB[r].series < STORYCITY_N)
+    if ((G.menu.screen == MENU_PRE || G.menu.story_day_select) && r >= 0 && RIVALDB[r].series >= 0 && RIVALDB[r].series < STORYCITY_N)
       city = STORYCITY[RIVALDB[r].series];
+    if (G.menu.story_day_select) {
+      char night_path[1200];
+      city_path(night_path, sizeof night_path, "", city, 1, "wpk");
+      G.menu.zones = access(night_path, R_OK) == 0 ? 2 : 1;
+      if (G.menu.zone >= G.menu.zones) G.menu.zone = 0;
+    }
   } else if (G.menu.game == MENU_GAME_TEN) {
     if (G.menu.screen == MENU_PRE) city = TEN_CITY[menu_ten_course(&G.menu)];
   } else if (G.menu.screen == MENU_BGM || G.menu.screen == MENU_PRE) /* decided, not while browsing */
@@ -3765,7 +3914,14 @@ static void menu_frame(float dt, double frame_start) {
   int old_count = G.menu.n_own, old_slot = G.menu.save_slot;
   if (old_count < 0 || old_count > MENU_OWN_MAX) old_count = 0;
   memcpy(old_own, G.menu.own, (size_t)old_count * sizeof old_own[0]);
+  int story_was_selecting = G.menu.story_day_select && !G.menu.deciding;
   int go = menu_update(&G.menu, dt);
+  if (story_was_selecting && G.menu.story_day_select && G.menu.deciding) {
+    char path[1200];
+    snprintf(path, sizeof path, "%s/story_timezone", G.save_dir);
+    FILE *tz = fopen(path, "w");
+    if (tz) { fputc('0' + G.menu.story_zone, tz); fclose(tz); }
+  }
   if (old_slot == G.menu.save_slot && G.menu.n_own >= 0 && G.menu.n_own <= MENU_OWN_MAX) {
     for (int i = 0; i < old_count; ++i) {
       int exists = 0;
@@ -3942,7 +4098,7 @@ static void menu_frame(float dt, double frame_start) {
       if (vs) menu_vs_loading(&G.menu), G.menu.vs.state = MENU_VS_LOBBY;
       else menu_open(&G.menu);
     } else {
-      spark_reset();
+      spark_reset(); backfire_reset();
       G.vs_race = vs ? G.n_rival : 0;
       if (vs) G.menu.vs.state = MENU_VS_RACE;
       fprintf(stderr, "race: course %d (%s), %s colour %d, power %d handling %d, %s\n", G.menu.course,
@@ -3964,7 +4120,7 @@ static void menu_frame(float dt, double frame_start) {
       G.rp.wet = (G.console || (G.ipad_graphics && G.hq_on)) && z && G.menu.wet_on ? 0.75f : 0.0f; /* (a night's road shines with its lights) */
       char path[1200];
       snprintf(path, sizeof path, "%s/timezone", G.save_dir);
-      FILE *tz = fopen(path, "w");
+      FILE *tz = G.menu.game == MENU_GAME_TA ? fopen(path, "w") : NULL;
       if (tz) {
         fputc('0' + z, tz);
         fclose(tz);
@@ -4350,7 +4506,8 @@ void app_frame(float dt) {
      * then back to the versus screen (Allan 10-27: the other one drove on alone) */
     if (!G.vs_closed && !G.menu.finish &&
         (net_host_closed() ||
-         (G.car.race.state == CAR_RACE_RUN && G.car.race.countdown <= 0.0f && net_silence(now_ms() * 1e-3) > VS_GONE))) {
+         (!vs_host_is_open() && G.car.race.state == CAR_RACE_RUN && G.car.race.countdown <= 0.0f &&
+           net_silence(now_ms() * 1e-3) > VS_GONE))) {
       G.vs_closed = 1;
       fprintf(stderr, "versus: the host %s\n", net_host_closed() ? "closed the game" : "went quiet");
     }
@@ -4475,6 +4632,7 @@ void app_frame(float dt) {
   for (int i = 0; i < steps; ++i) {
     if (G.ten_white && ++G.ten_white > 1 + TEN_WHITE_HOLD + TEN_WHITE_FADE) G.ten_white = 0;
     car_update(&G.car, &in);
+    backfire_tick();
     in.shift_up = in.shift_down = 0;
     /* clCarEffectManager::update's sparks, each car's */
     spark_step(0, G.car.body, &G.car.effect);
@@ -4779,6 +4937,7 @@ void app_frame(float dt) {
   lights_draw(&proj, &view, G.track_zone == 1, G.rp.time, &G.rp);
   lights_draw_goal(&proj, &view, &c->race, G.rp.time, &G.rp);
   lights_draw_ten_line(&proj, &view, &c->race, &G.rp);
+  backfire_draw(&vp, c->cam_pos, movie);
   if (!movie && !getenv("WMMT_NO_SPARK")) spark_draw(&proj, &view, &G.rp);
   render_blend_pass(0);
   SEG_END(SEG_LIGHTS);

@@ -1165,7 +1165,7 @@ static int day_select_step(menu_state *m, int tap, int key) {
     return 0;
   }
   /* (a versus' BGM is the host's: the others have no line) */
-  int bgm = !m->vs.day || m->vs.me == m->vs.host;
+  int bgm = !m->story_day_select && (!m->vs.day || m->vs.me == m->vs.host);
   int d = m->zones > 1 || !bgm ? 0 : key;
   /* the BGM line itself (with the arrow keys either side of it) steps on, like the button */
   if (bgm && tap && m->tap_x >= 170.0f && m->tap_x < 560.0f && m->tap_y >= 326.0f && m->tap_y < 392.0f) d = 1;
@@ -1177,7 +1177,8 @@ static int day_select_step(menu_state *m, int tap, int key) {
     return 0;
   }
   if (tap && on_card(m, 0)) {
-    day_decide(m);
+    if (m->story_day_select) { snd_menu(SND_SELECT); m->story_zone = m->zone; }
+    else day_decide(m);
     return 1;
   }
   return 0;
@@ -1330,7 +1331,7 @@ static void draw_day_select(const menu_state *m, int clock, float fade, int bars
     draw_topbar(bars, fade, &title);
   }
   anm_draw(ID.bottom, bars, fade);
-  if (m->vs.day && m->vs.me != m->vs.host) return; /* a versus' song is the host's */
+  if (m->story_day_select || (m->vs.day && m->vs.me != m->vs.host)) return; /* a versus' song is the host's */
   int set = card_bgm_set(m), line = m->sel;
   if (line < 0 || line >= CARD_BGM_SETS[set].lines) line = 0;
   anm_swap name[2] = { { anm_sprite(T_BGM_FONT), anm_sprite(BGM_TEXT + 30 * set + line) },
@@ -8404,6 +8405,15 @@ static void step(menu_state *m) {
     else car_select_enter(m, MENU_GAME);
     return;
   }
+  if (back && m->screen == MENU_BGM && m->story_day_select && m->from < 0 && !m->slide) {
+    snd_menu(SND_CANCEL);
+    m->story_day_select = 0;
+    m->zones = m->story_zones_saved;
+    m->zone = m->story_previous_zone;
+    st_rival_enter(m);
+    m->sel = m->story_n % 5;
+    return;
+  }
   if (back && m->screen > MENU_MAKER && m->screen <= MENU_BGM && m->from < 0 && m->rot_speed == 0.0f && !m->slide && !m->vs.day) {
     snd_menu(SND_CANCEL);
     car_select_enter(m, m->screen - 1);
@@ -8662,6 +8672,7 @@ int menu_update(menu_state *m, float dt) {
       } else if (m->screen == MENU_COURSE) {
         m->course = m->sel;
         go(m, MENU_BGM);
+        m->zone = m->ta_zone < m->zones ? m->ta_zone : 0;
         m->sel = card_bgm_saved_line(m);
         m->slide = m->card_t = 0;
         m->bars = 1;
@@ -8684,7 +8695,14 @@ int menu_update(menu_state *m, float dt) {
         m->story_n = 20 * st_division(m) + 5 * m->st_level + m->sel;
         m->story_pick = st_index(st_loop(m), m->story_n);
         if (m->story_pick > 111) m->story_pick = 111;
-        go(m, MENU_PRE);
+        /* Port extension, not an asserted arcade behavior. */
+        m->story_day_select = 1;
+        m->story_zones_saved = m->zones;
+        m->story_previous_zone = m->zone;
+        m->zone = m->story_zone;
+        go(m, MENU_BGM);
+        m->slide = m->card_t = 0;
+        m->bars = 1;
         m->song = 1 + rand() % (card_bgm_lines(m) - 2);
       } else if (m->screen == MENU_ST_TUNE) {
         /* the part going on (seqStTuneEff) */
@@ -8735,6 +8753,8 @@ int menu_update(menu_state *m, float dt) {
         m->tg.maker = WM_MAKER[m->sel];
         tg_wheel_open_at(m, m->tg.maker);
       } else if (m->screen == MENU_BGM) {
+        if (m->story_day_select) { m->story_day_select = 0; m->zones = m->story_zones_saved; }
+        else if (!m->vs.day && m->game == MENU_GAME_TA) m->ta_zone = m->zone;
         go(m, MENU_PRE);
       } else if (m->screen == MENU_PRE) {
         return 1;

@@ -84,7 +84,7 @@ def decode_vertices(f, va):
         elif name in ("normal", "uv"):
             out[name] = chunk.view("<f2").astype(np.float32).reshape(n, size // 2)
         elif name == "color":
-            out[name] = chunk  # BGRA bytes
+            out[name] = chunk[:, [2, 1, 0, 3]]  # stored RGBA; callers expect BGRA
     return out
 
 

@@ -29,6 +29,11 @@ typedef struct {
 typedef struct {
   float spark;
   float at[3], dir[3];
+  /* Raw SInfoCarEffect +0x84 and +0x30, sampled per 60 Hz car_update.
+   * Consumers must inspect each physics step, not each rendered frame. */
+  unsigned char backfire_pulse;
+  float backfire_vec[3];
+  int backfire_type; /* (int)length % 2; -1 if non-finite/out of int range */
 } car_effect;
 
 /* The time attack as the arcade's consoles show it: CSeq::Get2DInfoRace and Get2DInfoMap,
@@ -103,6 +108,7 @@ typedef struct {
   /* once over (play state 3, 6, 8 or 10): the run's log for the titles (yt::CTitle, CSeq::GetPlayLog) */
   int title_log_on;
   unsigned char title_log[CAR_TITLE_LOG];
+  int remain_valid; /* S2DInfoRace distance was finite, nonnegative and available */
 } car_race;
 
 typedef struct {

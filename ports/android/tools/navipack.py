@@ -24,13 +24,51 @@ from PIL import Image
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "stage"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import menupack  # noqa: E402
 import scene  # noqa: E402
 import tex  # noqa: E402
 
 AREA_NAMES = 0x93d9f84
 AREAS = 75
 VERTEX = np.dtype([("pos", "<f4", 3), ("uv", "<f4", 2), ("rgba", "u1", 4)])
+
+
+class Elf:
+    """Read file-backed addresses from a little-endian ELF32; never execute it."""
+
+    def __init__(self, path):
+        with open(path, "rb") as f:
+            self.d = f.read()
+        if len(self.d) < 52 or self.d[:7] != b"\x7fELF\x01\x01\x01":
+            raise ValueError("expected little-endian ELF32")
+        phoff = struct.unpack_from("<I", self.d, 28)[0]
+        entsize, count = struct.unpack_from("<HH", self.d, 42)
+        if entsize < 32 or phoff > len(self.d) or count > (len(self.d) - phoff) // entsize:
+            raise ValueError("invalid ELF program header table")
+        self.segs = []
+        for i in range(count):
+            typ, off, va, _, size, memsize, _, _ = struct.unpack_from("<8I", self.d, phoff + i * entsize)
+            if typ == 1:
+                if size > memsize or off > len(self.d) or size > len(self.d) - off or va + size > 0x100000000:
+                    raise ValueError("invalid ELF load segment")
+                self.segs.append((va, off, size))
+
+    def _range(self, va, size):
+        matches = [(o + va - v, o + n) for v, o, n in self.segs
+                   if v <= va and va + size <= v + n and va < v + n]
+        if len(matches) != 1:
+            raise ValueError("unmapped or ambiguous ELF address: %#x" % va)
+        return matches[0]
+
+    def u32(self, va):
+        off, _ = self._range(va, 4)
+        return struct.unpack_from("<I", self.d, off)[0]
+
+    def cstr(self, va):
+        off, end = self._range(va, 1)
+        terminator = self.d.find(b"\0", off, end)
+        if terminator < 0:
+            raise ValueError("unterminated ELF string at %#x" % va)
+        return self.d[off:terminator].decode("latin1")
 
 
 def image_rgba(f, img, bgr=False):
@@ -44,7 +82,7 @@ def image_rgba(f, img, bgr=False):
 
 
 def pack(data_dir, main, out, navi="SkNavi.igb"):
-    elf = menupack.Elf(main)
+    elf = Elf(main)
     area_of = {}
     for a in range(1, AREAS):
         on, off = elf.u32(AREA_NAMES + 12 * a), elf.u32(AREA_NAMES + 12 * a + 4)
