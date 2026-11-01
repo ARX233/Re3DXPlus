@@ -675,12 +675,20 @@ static void ctx_init(vctx *c, int loader) {
   c->unpack = c->pack = 4;
 }
 
+/* Outside vctx: preview snapshots restore vctx and must not roll back the epoch. */
+static uint64_t main_error_epoch, loader_error_epoch;
 static vctx main_ctx, loader_ctx;
 static __thread vctx *cur_tls;
 static vctx *ctx(void) { return cur_tls ? cur_tls : &main_ctx; }
 
 static void set_err(GLenum e) {
   vctx *c = ctx();
+  uint64_t *epoch = c == &main_ctx ? &main_error_epoch : c == &loader_ctx ? &loader_error_epoch : NULL;
+  if (epoch) {
+    uint64_t old = __atomic_load_n(epoch, __ATOMIC_RELAXED);
+    while (old != UINT64_MAX && !__atomic_compare_exchange_n(epoch, &old, old + 1, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+  }
+  /* Unknown contexts remain untrusted; vkgl_error_epoch returns UINT64_MAX for them. */
   if (!c->err) c->err = e;
 }
 
@@ -1448,7 +1456,7 @@ GLenum vkgl_glCheckFramebufferStatus(GLenum target) {
   vimg *c = att_image(&f->color), *d = att_image(&f->depth), *s = att_image(&f->stencil);
   if (!c && !d) return GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT;
   if ((f->color.kind && (!c || !c->att || is_depth(c->fmt))) || (f->depth.kind && (!d || !is_depth(d->fmt))) ||
-      (f->stencil.kind && s != d))
+      (f->stencil.kind && (!s || s != d || !has_stencil(s->fmt))))
     return GL_FRAMEBUFFER_UNSUPPORTED;
   if (c && d) {
     int cs = f->color.samples ? f->color.samples : c->samples;
@@ -3200,6 +3208,10 @@ void vkgl_glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GL
   bufmem_free(b);
 }
 
+/* Non-consuming error observation for the history validity guard. */
+int vkgl_error_pending(void) { return ctx()->err != GL_NO_ERROR; }
+uint64_t vkgl_error_epoch(void) { vctx *c = ctx(); uint64_t *e = c == &main_ctx ? &main_error_epoch : c == &loader_ctx ? &loader_error_epoch : NULL; return e ? __atomic_load_n(e, __ATOMIC_RELAXED) : UINT64_MAX; }
+
 /* ---- queries ---- */
 
 GLenum vkgl_glGetError(void) {
@@ -3213,8 +3225,10 @@ void vkgl_glGetIntegerv(GLenum p, GLint *v) {
   vctx *c = ctx();
   switch (p) {
   case GL_FRAMEBUFFER_BINDING: *v = (GLint)c->draw_fb; return;
+  case GL_ACTIVE_TEXTURE: *v = (GLint)(GL_TEXTURE0 + c->unit); return;
   case GL_VIEWPORT: memcpy(v, c->vp, sizeof c->vp); return;
   case GL_SCISSOR_BOX: memcpy(v, c->sc, sizeof c->sc); return;
+  case GL_DEPTH_FUNC: *v = (GLint)c->dfunc; return;
   case GL_MAX_SAMPLES_: *v = D.max_samples; return;
   case GL_BLEND_SRC_RGB: case GL_BLEND_SRC_ALPHA: *v = (GLint)c->bsrc; return;
   case GL_BLEND_DST_RGB: case GL_BLEND_DST_ALPHA: *v = (GLint)c->bdst; return;
@@ -3232,6 +3246,8 @@ void vkgl_glGetIntegerv(GLenum p, GLint *v) {
 void vkgl_glGetBooleanv(GLenum p, GLboolean *v) {
   vctx *c = ctx();
   if (p == GL_DEPTH_WRITEMASK) *v = (GLboolean)c->depth_write;
+  else if (p == GL_SCISSOR_TEST) *v = c->scissor_test ? GL_TRUE : GL_FALSE;
+  else if (p == GL_DEPTH_TEST) *v = c->depth_test ? GL_TRUE : GL_FALSE;
   else if (p == GL_COLOR_WRITEMASK) for (int i = 0; i < 4; ++i) v[i] = (GLboolean)(c->cmask >> i & 1);
   else *v = GL_FALSE;
 }

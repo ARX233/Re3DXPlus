@@ -10,7 +10,7 @@ METRE = 0x272
 
 TABLE, COUNT = 0x9551560, 0x1f9b
 RECORD = struct.Struct('<iH6f4h4h')
-ANIMS = ('cons_g_last_000m', 'cons_g_last_saigo')
+ANIMS = ('cons_g_last_000m', 'cons_g_last_saigo', 'cons_g_last_tonikaku')
 
 def take(data, pos, n):
     if n < 0 or pos+n > len(data): raise ValueError('truncated bank')

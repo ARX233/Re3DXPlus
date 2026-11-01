@@ -30,7 +30,6 @@ static struct {
   int go_new;
   int closed; /* the host's CLOSED came */
   uint32_t race; /* the race this machine is in (0 none) */
-  int race_n, race_pcb; /* active GO snapshot, independent of a pending GO */
   /* the newest race packet from each machine, not yet handed over */
   unsigned char rx[CAR_LINK_MACHINES][CAR_LINK_PACKET];
   int rx_new[CAR_LINK_MACHINES];
@@ -129,9 +128,7 @@ static void got(const unsigned char *b, int len, double now) {
     if (len < 5 + CAR_LINK_PACKET) return;
     uint32_t race = get32(p);
     int pcb = p[4];
-    /* The relay does not authenticate the claimed PCB; at least do not hand
-     * our own or a machine outside the active race roster to the game. */
-    if (!N.race || race != N.race || pcb >= N.race_n || pcb >= CAR_LINK_MACHINES || pcb == N.race_pcb) return;
+    if (race != N.race || pcb < 0 || pcb >= CAR_LINK_MACHINES) return;
     uint32_t count = get32(p + 5 + PACKET_COUNT);
     if (N.rx_any[pcb] && (int32_t)(count - N.rx_count[pcb]) < 0) return; /* came in late */
     memcpy(N.rx[pcb], p + 5, CAR_LINK_PACKET);
@@ -141,7 +138,6 @@ static void got(const unsigned char *b, int len, double now) {
     return;
   }
   if (b[3] == CLOSED) {
-    if (len < 4) return; /* host id */
     N.closed = 1;
     return;
   }
@@ -150,13 +146,12 @@ static void got(const unsigned char *b, int len, double now) {
     net_lobby l;
     memset(&l, 0, sizeof l);
     l.connected = 1;
-    l.n = p[0];
+    l.n = p[0] > NET_PLAYERS ? NET_PLAYERS : p[0];
     l.me = p[1];
     l.host = p[2];
-    if (l.n < 1 || l.n > NET_PLAYERS || l.me >= l.n || l.host >= l.n) return;
     int at = 9;
     for (int i = 0; i < l.n; ++i) {
-      if (at + 1 > len || p[at] != i) return;
+      if (at + 1 > len) return;
       int k = read_player(p + at + 1, len - at - 1, &l.player[i], 1);
       if (k < 0) return;
       at += 1 + k;
@@ -173,19 +168,16 @@ static void got(const unsigned char *b, int len, double now) {
     g.seed = get32(p + 4);
     g.ramp = p[8];
     g.km = p[9];
-    g.n = p[10];
+    g.n = p[10] > NET_PLAYERS ? NET_PLAYERS : p[10];
     g.pcb = p[11];
-    if (!g.race || g.n < 2 || g.n > NET_PLAYERS || g.n > CAR_LINK_MACHINES || g.pcb >= g.n) return;
     if (g.race == N.go.race || g.race == N.race) return; /* said again */
-    unsigned seen = 0;
     int at = 12;
     for (int i = 0; i < g.n; ++i) {
       if (at + 1 > len) return;
       int pcb = p[at];
       net_player pl;
       int k = read_player(p + at + 1, len - at - 1, &pl, 0);
-      if (k < 0 || pcb >= g.n || (seen & (1u << pcb))) return;
-      seen |= 1u << pcb;
+      if (k < 0 || pcb >= NET_PLAYERS) return;
       g.player[pcb] = pl;
       at += 1 + k;
     }
@@ -205,7 +197,7 @@ void net_poll(double now, int status, const char *name, const unsigned char *pro
   if (now - N.last_hello < HELLO_EVERY && status == N.last_status) return;
   N.last_hello = now;
   N.last_status = status;
-  int pl = !profile || profile_len < 0 ? 0 : profile_len > NET_PROFILE ? NET_PROFILE : profile_len;
+  int pl = profile_len < 0 ? 0 : profile_len > NET_PROFILE ? NET_PROFILE : profile_len;
   unsigned char h[4 + 4 + 1 + NET_NAME + 1 + NET_PROFILE];
   head(h, HELLO);
   put32(h + 4, N.id);
@@ -230,25 +222,23 @@ void net_start(int ramp, int km, int song) {
 int net_host_closed(void) { return N.closed; }
 
 int net_take_go(net_go *go) {
-  if (!go || !N.go_new) return 0;
+  if (!N.go_new) return 0;
   N.go_new = 0;
   *go = N.go;
   /* the race's packets from now on */
   N.race = N.go.race;
-  N.race_n = N.go.n;
-  N.race_pcb = N.go.pcb;
   memset(N.rx_new, 0, sizeof N.rx_new);
   memset(N.rx_any, 0, sizeof N.rx_any);
   return 1;
 }
 
 void net_race_send(const unsigned char *packet, int len) {
-  if (!net_is_open() || !N.race || len < 0 || len > CAR_LINK_PACKET || (len && !packet)) return;
+  if (!net_is_open() || !N.race || len > CAR_LINK_PACKET) return;
   unsigned char b[4 + 5 + CAR_LINK_PACKET];
   head(b, RACE);
   put32(b + 4, N.race);
-  b[8] = (unsigned char)N.race_pcb;
-  if (len) memcpy(b + 9, packet, (size_t)len);
+  b[8] = (unsigned char)N.go.pcb;
+  memcpy(b + 9, packet, (size_t)len);
   tx(b, 9 + len);
 }
 
@@ -332,8 +322,7 @@ void net_scan(double now, int on) {
 }
 
 int net_found_list(net_found *out, int max) {
-  if (!out || max <= 0) return 0;
   int n = S.n < max ? S.n : max;
-  if (n) memcpy(out, S.found, sizeof out[0] * (size_t)n);
+  memcpy(out, S.found, sizeof out[0] * (size_t)n);
   return n;
 }

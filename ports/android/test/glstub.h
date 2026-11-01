@@ -48,5 +48,8 @@ void glBlendFuncSeparate(GLenum,GLenum,GLenum,GLenum);
 #define GL_TRIANGLE_FAN 0x0006
 #define GL_SCISSOR_TEST 0x0C11
 #define GL_VIEWPORT 0x0BA2
-void glScissor(GLint,GLint,GLsizei,GLsizei); void glGetIntegerv(GLenum,GLint*); void glVertexAttrib4f(GLuint,GLfloat,GLfloat,GLfloat,GLfloat);
+#define GL_SCISSOR_BOX 0x0C10
+#define GL_DEPTH_FUNC 0x0B74
+#define GL_DEPTH_WRITEMASK 0x0B72
+void glScissor(GLint,GLint,GLsizei,GLsizei); void glGetIntegerv(GLenum,GLint*); void glGetBooleanv(GLenum,GLboolean*); void glVertexAttrib4f(GLuint,GLfloat,GLfloat,GLfloat,GLfloat);
 void glGenVertexArraysOES(GLsizei,GLuint*); void glBindVertexArrayOES(GLuint); void glDeleteVertexArraysOES(GLsizei,const GLuint*);

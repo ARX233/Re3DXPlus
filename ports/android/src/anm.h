@@ -7,6 +7,7 @@
 /* A screen wider than 4:3 (an iPhone's 3:2): the 1024x768 layout in its middle, edge more
  * on each side (0 on the iPad); anm_fill covers all of it. */
 void anm_view(float edge);
+float anm_edge(void); /* the extra width on each side in 1024-wide layout pixels */
 /* 1 if this frame drew a menu bar or a full-width fill out to such a screen's sides (anm.c
  * lays those out 16:9 itself): app.c then leaves the sides as they are */
 int anm_wide_drawn(void);
@@ -35,6 +36,13 @@ int anm_find(const char *name);
 int anm_frames(int anim);
 /* Packed index of the arcade's sprite id (or a pre-rendered text, menupack.py TEXT_BASE + k), or -1. */
 int anm_sprite(int arcade_id);
+/* Borrow the packed sprite's GL texture, loading it on first use. The caller
+ * must have the same live GL context used by anm_load current; this API cannot
+ * verify context identity or detect context loss. Returns 0 for invalid index,
+ * absent current context (where detectable), or failed load. Reacquire each
+ * frame: anm_trim may delete a handle not touched for over 180 frames. Do not
+ * delete or cache the borrowed handle across trim/context recreation. */
+unsigned int anm_sprite_texture(int sprite);
 /* Draw one frame; alpha fades the whole layer (1 = as authored). */
 void anm_draw(int anim, int frame, float alpha);
 /* clSpriteAnime::setImageReplace: draw packed sprite `to` (-1 = nothing) wherever the frame

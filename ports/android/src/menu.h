@@ -5,6 +5,26 @@
 #ifndef MENU_H
 #define MENU_H
 
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+#include "pre_race_tune.h"
+#endif
+#if defined(__ANDROID__) || defined(WMMT_HUD_CUSTOM_TEST)
+#include "hud_custom_store.h"
+enum { CUSTOM_DIRTY_DEADZONE=1u<<0, CUSTOM_DIRTY_SHIFT=1u<<1,
+       CUSTOM_DIRTY_MAP=1u<<2, CUSTOM_DIRTY_RANK=1u<<3,
+       CUSTOM_DIRTY_TIME=1u<<4, CUSTOM_DIRTY_METER=1u<<5 };
+#endif
+
+/* Stable option-file values: 0/1 retain the old buttons/gyro meaning. */
+static inline int menu_steer_valid(int mode) { return mode >= 0 && mode < 4 ? mode : 0; }
+static inline int menu_steer_hit(float x, float y) {
+  if (y < 137.0f || y >= 167.0f || x < 300.0f || x >= 636.0f) return -1;
+  return (int)((x - 300.0f) / 84.0f);
+}
+static inline int menu_story_cut_loop(int st_div, int story_test) {
+  return (story_test >= 1 && story_test <= 10 ? story_test - 1 : st_div) / 5;
+}
+
 #define MENU_VS_PLAYERS 4
 #define MENU_VS_FOUND 4
 /* the dress-up GET screens a race can bring (a 10-in-a-row run: a part a rival beaten) */
@@ -84,6 +104,8 @@ typedef struct {
    * 20 episodes each, four levels of five), st_bits the division's cleared episodes. The app
    * keeps them (data_dir/garage); menu_story_clear moves them on. */
   int st_div, st_bits;
+  int story_test, ta_traffic; /* testing chapter page (1..10), TA traffic option */
+  int card_color_pending; /* defer owned-car colour until card confirmation */
   int st_level;    /* the level select's choice */
   int story_pick;  /* the rival select's choice: its story index (src/rivaldb.h's select), -1 none */
   int story_n;     /* and its place in the loop, 20 * division + 5 * level + episode */
@@ -136,8 +158,14 @@ typedef struct {
    * garage_changed when one changes; the app keeps them (data_dir/garage) and clears it. */
   signed char tune_full[MENU_GARAGE_MAKERS][MENU_GARAGE_CARS], tune_power[MENU_GARAGE_MAKERS][MENU_GARAGE_CARS];
   int manual;
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+  pre_race_tune pre_tune;
+  int pre_tune_origin, pre_tune_bgm_sel, pre_tune_story_day, pre_tune_setting;
+  void *pre_tune_car_touch;
+  int pre_tune_car_inside;
+#endif
   /* The port's OPTION screen (MENU_OPTION, the gear key on the maker select): steering by
-   * the touch keys (0) or by tilting the iPad (1), the tilt's sensitivity (1..10) and the
+   * BUTTONS (0), GYRO (1), WHEEL (2), or STICK (3), the tilt's sensitivity (1..10) and the
    * bridge reflection on the car (on 1), the FSR sharpening (on 1), the cars' baked ambient
    * occlusion (on 1) and the back mirror (on 1); kept with the garage too. */
   int gyro, gyro_sens, over_on, sharp_on, pedal_slide, ao_on, bm_on;
@@ -146,14 +174,22 @@ typedef struct {
    * occlusion, the wet road, the paint's reflection and the anti-aliasing (4x 1, 2x 0, from
    * the next start) */
   int hq_rows, hd_tex, bloom_on, ssao_on, wet_on, paint_on, aa4;
-  int enhance_on, enhance_changed; /* independent of the old option/garage format */
   /* and on an iPad (res_row, set by the app), the screen's resolution: 1024x768 (0) or the
    * Retina iPads' 2048x1536 (1), from the next start (main.m reads it from the options) */
   int res_row, hires;
   /* the gear key pressed; the maker under the cursor meanwhile; the screen it was pressed on
    * (the maker select or the SAVE DATA screen) */
   int option, opt_sel, opt_from;
-  int key_k[3], key_dx[3], key_dy[3], key_layout_dirty;
+  int key_k[3], key_dx[3], key_dy[3];
+  int key_base_k[3], key_base_dx[3], key_base_dy[3];
+  unsigned key_layout_dirty; /* one bit per legacy group */
+  int key_retry_frames, key_save_failed;
+#if defined(__ANDROID__) || defined(WMMT_HUD_CUSTOM_TEST)
+  HudCustomLayout custom_layout, custom_layout_base;
+  unsigned custom_layout_dirty; /* CUSTOM_DIRTY_* fields explicitly edited by the user */
+  int custom_layout_status, custom_retry_frames, lay_page, lay_shift_old_separate;
+  int stick_center_mode, stick_center_dirty, stick_center_status, stick_center_retries, stick_center_retry_frames;
+#endif
   int lay_sel, lay_drag, lay_tap, lay_button_down, lay_old_dx, lay_old_dy;
   void *lay_touch;
   float lay_x, lay_y;
@@ -164,7 +200,7 @@ typedef struct {
   int dress, dress_free, dress_kind;
   /* the save's car view's delete key pressed (erase), once to arm it, again to delete */
   int erase, erase_armed;
-  int garage_changed;
+  int garage_changed, options_dirty; /* options_dirty: chapter testing / TA traffic only */
   /* The port's SAVE DATA screen (MENU_SAVE, between START and the maker select; the
    * arcade's card check stands there): NEW GAME or LOAD GAME lit, the save of a NEW GAME
    * tapped once (it must be tapped again to start over in it, 0 none). The app keeps the
@@ -343,6 +379,7 @@ typedef struct {
     char name[MENU_VS_PLAYERS][17], car[MENU_VS_PLAYERS][32];
     short glyph[MENU_VS_PLAYERS][5]; /* the names' own characters (namedb.h's, -1 past the end; none from an older build) */
     int racing[MENU_VS_PLAYERS];
+    unsigned char mismatch[MENU_VS_PLAYERS]; /* incompatible race build: block start */
     int ramp, km;        /* the host's choice (the others: the last race's) */
     int last_place, last_n; /* the last race's place of how many (0 none) */
     int held;            /* the button under the finger (1 + its number), 0 none */
@@ -407,7 +444,8 @@ enum { MENU_MOVIE, MENU_TITLE, MENU_RANKING, MENU_LOGO, MENU_PROLOGUE, MENU_STAR
        MENU_ST_LEVEL, MENU_ST_RIVAL, MENU_PRE, MENU_ST_TUNE, MENU_TEN_COURSE, MENU_TEN_LEVEL,
        MENU_TG_GET, MENU_TG_AERO, MENU_TG_PART, MENU_TG_WEAR, MENU_OPTION, MENU_SAVE, MENU_HAVE, MENU_GARAGE,
        MENU_CARD, MENU_LVUP, MENU_ST_EFF, MENU_TG_WHEEL, MENU_TG_SELECT, MENU_TG_MAKER, MENU_NAME,
-       MENU_TG_VINYL, MENU_VS, MENU_VS_SEL, MENU_VS_AREA, MENU_VS_MATCH, MENU_SHOGO, MENU_VS_STAR, MENU_INFO, MENU_LAYOUT };
+       MENU_TG_VINYL, MENU_VS, MENU_VS_SEL, MENU_VS_AREA, MENU_VS_MATCH, MENU_SHOGO, MENU_VS_STAR, MENU_INFO, MENU_LAYOUT
+};
 enum { MENU_GAME_STORY, MENU_GAME_TEN, MENU_GAME_TA, MENU_GAME_VS };
 
 /* The cars the car select shows in 3D this frame (the carousel, or the colour turntable),
@@ -539,6 +577,8 @@ int menu_vs_stars(menu_state *m, int place, int n);
 void menu_vs_star_open(menu_state *m);
 /* the host closed the game under a versus race: back to MENU_VS, off, with `note` on it */
 void menu_vs_closed(menu_state *m, const char *note);
+/* Keep the existing connection/host while returning an aborted race to its lobby. */
+void menu_vs_aborted(menu_state *m, const char *note);
 /* The area vote's status byte (the lobby's HELLO, which the servers pass on unread): 0 the
  * lobby, 1 racing, MENU_VS_CHOOSING + card while choosing, MENU_VS_VOTED + card voted,
  * MENU_VS_OMAKASE + card voted by omakase, MENU_VS_FINAL + card the host's result */

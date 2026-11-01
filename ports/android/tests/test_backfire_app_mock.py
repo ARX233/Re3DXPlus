@@ -52,7 +52,13 @@ int main(int argc, char **argv) {
 with tempfile.TemporaryDirectory() as tmp:
  for platform in ("android","ipad"):
   src=ROOT/"ports"/platform/"src"; text=(src/"app.c").read_text(); start=text.index("/* Published backfire directories"); end=text.index("static void vs_ip_load(void);",start)
-  test=Path(tmp)/(platform+".c");test.write_text(PRE+text[start:end]+MAIN);exe=Path(tmp)/platform
+  helpers=text[start:end]
+  # Android's tire renderer lives between the backfire helpers; it has its own tests.
+  marker='#ifdef __ANDROID__\n/* clTireTrackManager'
+  if marker in helpers:
+   tire_start=helpers.index(marker); tire_end=helpers.index('static void backfire_open(',tire_start)
+   helpers=helpers[:tire_start]+helpers[tire_end:]
+  test=Path(tmp)/(platform+".c");test.write_text(PRE+helpers+MAIN);exe=Path(tmp)/platform
   flags=['-D__ANDROID__'] if platform=='android' else []
   subprocess.run(["cc","-D_XOPEN_SOURCE=700",*flags,"-std=c99","-I",str(src),str(test),str(src/"backfire.c"),"-lm","-o",str(exe)],check=True)
   root=Path(tmp)/(platform+'root'); root.mkdir()

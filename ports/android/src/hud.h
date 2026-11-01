@@ -6,9 +6,15 @@
 #include "car.h"
 
 enum { TOUCH_BEGAN, TOUCH_MOVED, TOUCH_ENDED, TOUCH_CANCELLED };
+enum { HUD_STEER_KEYS, HUD_STEER_GYRO, HUD_STEER_WHEEL, HUD_STEER_STICK, HUD_STEER_MODES };
+enum { HUD_STICK_FLOAT, HUD_STICK_FIXED };
 
 typedef struct {
   void *left_touch, *right_touch; /* steering buttons */
+  int steer_mode; /* default KEYS; use hud_set_steer_mode when changing */
+  int stick_center_mode;
+  void *steer_touch;
+  float steer_v, wheel_turn, wheel_last, stick_x0, stick_y0, stick_x, stick_y;
   void *throttle_touch, *brake_touch;
   int shift_up, shift_down; /* pending presses, consumed by hud_input */
   int camera_pressed, reset_pressed, trans_pressed;
@@ -26,6 +32,13 @@ typedef struct {
 } hud_state;
 
 void hud_init(hud_state *h, float screen_w, float screen_h);
+/* Call on mode changes, including GYRO; clears active controls to prevent stuck touches. */
+void hud_set_steer_mode(hud_state *h, int mode);
+void hud_set_stick_center_mode(hud_state *h, int mode);
+/* mode-aware layout variants; legacy functions below retain their boolean gyro API. */
+int hud_layout_hit_mode(int mode, float x, float y);
+void hud_layout_clamp_mode(int group, int mode, float k, float *dx, float *dy);
+void hud_draw_layout_mode(float screen_w, float screen_h, int mode, int sel);
 /* A screen wider than 4:3 (an iPhone's 3:2): edge layout px more on each side of the
  * 1024x768 layout (0 on the iPad); the consoles move out to the sides, the race's touch keys
  * too, key_k times their size. */
@@ -45,7 +58,11 @@ void hud_set_class(int cls);
 void hud_set_card(int title, const short *name);
 /* `id` identifies a finger (the UITouch pointer on iOS). */
 void hud_touch(hud_state *h, void *id, int phase, float x, float y);
-/* Fill the car input from the controls; edge-triggered buttons are consumed. */
+/* Fill input and consume edge-triggered buttons. dt is elapsed seconds; invalid or
+ * nonpositive values do not advance wheel return, and values above 0.1s are capped.
+ * Call once per input tick. Full lock returns to center in 1/3s of accepted time. */
+void hud_input_dt(hud_state *h, car_input *in, float dt);
+/* Compatibility wrapper: advances as one 1/60s tick. */
 void hud_input(hud_state *h, car_input *in);
 
 int hud_gl_init(void);
@@ -83,10 +100,10 @@ int hud_sign_blinks(int sign);
 void hud_set_records(float record, float yours);
 /* A story race: the time attack's records and course name are left out. */
 void hud_set_story(int story);
-/* A story race's rivals by their place (RIVALDB's slot): ECharacter and whether they get a box
- * (src/storyinfo.h's STORYINFO_SHOWN), n of them; sel the story select (the marks over the
- * cars: nsMenuCheck::checkSrotyIrregularRival) */
-void hud_set_story_rivals(const int *chara, const unsigned char *shown, int n, int sel);
+/* A story race's rivals by slot: ECharacter, box visibility, select, original
+ * series ID, and whether those slots still match the actual physics inputs. */
+void hud_set_story_rivals(const int *chara, const unsigned char *shown, int n, int sel,
+                          int series, int ranking_slots_valid);
 /* A 10-in-a-row race at the level (0..9, 10 the 32-man extend), -1 for none: clTenConsole's
  * LV, rival count and split times stand in for the time attack's column. */
 void hud_set_ten(int level);
@@ -107,7 +124,16 @@ void hud_set_vs(const hud_vs_box *box, int n);
 void hud_ten_cutin(const car_race *r, int frames);
 /* Separate race dialogue; loop is the card's story-clear loop, not its race index. */
 void hud_story_cutin_start(int select, int loop);
+/* continuous=1 ONLY for the next period of the same uninterrupted attempt;
+ * retries, returns, new stories and changed loops must use 0/start. Different
+ * select/loop always reset. Queued but unpresented rows are never carried. */
+void hud_story_cutin_period(int select, int loop, int continuous);
 void hud_story_cutin_step(const car_race *r, int hit);
+/* End a confirmed intermediate period without queuing its final result line. */
+void hud_story_cutin_suspend(void);
+/* Bounded port timing for result dialogue during the goal freeze. This may
+ * initialize the result event if the goal appeared after the latest tick. */
+int hud_story_cutin_goal_hold(const car_race *r);
 /* Draw separately after the finish layer, including Goal and TimeUp states. */
 void hud_story_cutin_draw(void);
 /* A story realtime movie's show (src/storydemo.h's table, -1 none): started with the movie
@@ -126,11 +152,29 @@ void hud_white(const hud_state *h, float alpha);
 void hud_fade(const hud_state *h, float grey, float alpha);
 /* The race camera's view and projection (column-major), for the rival's mark over its car */
 void hud_rival_view(const float view[16], const float proj[16]);
-/* Port extension: player distance for all modes; -1 when not running or invalid. */
-int hud_finish_metres(int play_state, float remain);
+/* -1: hidden/unknown; otherwise leader's remaining metres (0..600).
+ * story_excluded marks original non-ranking story slots; trailing receives
+ * whether a competing opponent leads; ties count as not trailing. */
+int hud_finish_result(const car_race *r, int story, int count, unsigned story_excluded,
+                      int ten, int versus, int *trailing);
 void hud_draw(const hud_state *h, const car_state *car, const car_input *in, float fps);
 
+/* Race console transforms in 1024x768 layout points; identity is (1,0,0). */
+enum { HUD_RACE_MAP, HUD_RACE_RANK, HUD_RACE_TIME, HUD_RACE_METER, HUD_RACE_GROUPS };
+void hud_race_layout_set(int group, float k, float dx, float dy);
+int hud_race_layout_hit(float x, float y);
+/* Largest scale fitting the current visible layout, capped at 1.6 and floored
+ * at 0.6 for sidecar v1. If even 0.6 cannot fit, clamp centers the oversized
+ * group and clipping remains possible. The editor displays/persists its choice. */
+float hud_race_layout_max_scale(int group);
+void hud_race_layout_clamp(int group, float k, float *dx, float *dy);
+void hud_draw_race_layout(float screen_w, float screen_h, int sel);
+
 enum { HUD_KEYS_TOP, HUD_KEYS_LEFT, HUD_KEYS_RIGHT, HUD_KEY_GROUPS };
+enum { HUD_EDIT_SHIFT = 3 };
+void hud_set_stick_deadzone_percent(int percent);
+/* Separate transform is absolute, anchored like the right keys; disabled inherits them. */
+void hud_shift_layout_set(int separate, float k, float dx, float dy);
 #define HUD_KEY_K_MIN 0.6f
 #define HUD_KEY_K_MAX 1.6f
 void hud_layout_set(int group, float k, float dx, float dy);

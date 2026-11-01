@@ -37,6 +37,18 @@ static rect PAUSE = { 236, 12, 48, 48 }; /* the pause menu */
 static rect RESET = { 296, 12, 48, 48 };
 static rect CAMERA = { 116, 12, 48, 48 };
 static rect TRANS = { 176, 12, 48, 48 }; /* AT/MT */
+#define WHEEL_CX 141.0f
+#define WHEEL_CY 640.0f
+#define WHEEL_R 112.0f
+#define WHEEL_LOCK 1.5708f
+static const rect STICK_ZONE = { 0, 430, 430, 338 };
+#define STICK_R 90.0f
+static float stick_dead = 0.08f;
+void hud_set_stick_deadzone_percent(int percent) {
+  if (percent < 0) percent = 0;
+  if (percent > 50) percent = 50;
+  stick_dead = percent * 0.01f;
+}
 /* the gyro layout: the brake where the steer buttons were, the shift buttons where the brake was */
 static const rect G_BRAKE = { 16, 604, 250, 150 };
 static const rect G_SHIFT_UP = { 812, 610, 96, 68 };
@@ -55,6 +67,13 @@ static const rect MENU_HIDDEN = { 328, 652, 368, 56 }; /* between the left and r
 static float EDGE, KEY_K = 1;
 enum { KEY_TOP, KEY_LEFT, KEY_RIGHT };
 static float USER_K[3] = {1,1,1}, USER_DX[3], USER_DY[3];
+static int shift_separate;
+static float shift_k = 1, shift_dx, shift_dy;
+void hud_shift_layout_set(int separate, float k, float dx, float dy) {
+  shift_separate = !!separate;
+  shift_k = k < HUD_KEY_K_MIN ? HUD_KEY_K_MIN : k > HUD_KEY_K_MAX ? HUD_KEY_K_MAX : k;
+  shift_dx = dx; shift_dy = dy;
+}
 
 /* a touch key's layout rect where it is on screen */
 static rect place(rect r, int side, float k, float dx, float dy) {
@@ -64,6 +83,14 @@ static rect place(rect r, int side, float k, float dx, float dy) {
   return (rect){ox + ex + dx + (r.x - ox)*k, oy + dy + (r.y - oy)*k, r.w*k, r.h*k};
 }
 static rect key(rect r, int side) { return place(r, side, USER_K[side], USER_DX[side], USER_DY[side]); }
+static rect shift_key(rect r) {
+  return shift_separate ? place(r, KEY_RIGHT, shift_k, shift_dx, shift_dy) : key(r, KEY_RIGHT);
+}
+
+static void unkey(int side, float x, float y, float *lx, float *ly) {
+  rect o = key((rect){0, 0, 1, 1}, side);
+  *lx = (x - o.x) / o.w; *ly = (y - o.y) / o.h;
+}
 
 /* the projection of the layout's 1024x768 on the whole screen */
 static mat4 screen_ortho(float w, float h) { return mat4_ortho(-EDGE, w + EDGE, h, 0, -1, 1); }
@@ -104,9 +131,80 @@ void hud_init(hud_state *h, float screen_w, float screen_h) {
   h->screen_h = screen_h;
 }
 
+void hud_set_steer_mode(hud_state *h, int mode) {
+  if (mode < HUD_STEER_KEYS || mode > HUD_STEER_STICK) mode = HUD_STEER_KEYS;
+  if (h->steer_mode == mode && h->gyro == (mode == HUD_STEER_GYRO)) return;
+  h->steer_mode = mode; h->gyro = mode == HUD_STEER_GYRO;
+  h->left_touch = h->right_touch = h->steer_touch = NULL;
+  h->throttle_touch = h->brake_touch = NULL;
+  h->steer_v = h->wheel_turn = h->wheel_last = 0;
+}
+
+void hud_set_stick_center_mode(hud_state *h, int mode) {
+  mode = mode == HUD_STICK_FIXED ? HUD_STICK_FIXED : HUD_STICK_FLOAT;
+  if (h->stick_center_mode == mode) return;
+  h->stick_center_mode = mode;
+  if (h->steer_mode == HUD_STEER_STICK) {
+    h->steer_touch = NULL;
+    h->steer_v = h->wheel_turn = h->wheel_last = 0;
+  }
+}
+
+static void stick_position(hud_state *h, float lx, float ly) {
+  float dx = lx-h->stick_x0, dy = ly-h->stick_y0, r = sqrtf(dx*dx+dy*dy);
+  if (r > STICK_R) dx *= STICK_R/r, dy *= STICK_R/r;
+  h->stick_x = h->stick_x0+dx; h->stick_y = h->stick_y0+dy;
+  float v = dx/STICK_R, a = fabsf(v);
+  a = a <= stick_dead ? 0 : (a-stick_dead)/(1-stick_dead);
+  h->steer_v = v < 0 ? -a : a;
+}
+
+static int steer_touch(hud_state *h, void *id, int phase, float x, float y) {
+  if (!id) return 0;
+  if (id == h->steer_touch && phase != TOUCH_BEGAN && phase != TOUCH_MOVED) {
+    h->steer_touch = NULL;
+    if (phase == TOUCH_CANCELLED || h->steer_mode == HUD_STEER_STICK)
+      h->steer_v = h->wheel_turn = 0;
+    return 1;
+  }
+  if (h->gyro || (h->steer_mode != HUD_STEER_WHEEL && h->steer_mode != HUD_STEER_STICK)) return 0;
+  float lx, ly; unkey(KEY_LEFT, x, y, &lx, &ly);
+  int wheel = h->steer_mode == HUD_STEER_WHEEL;
+  if (phase == TOUCH_BEGAN && !h->steer_touch) {
+    float dx = lx - WHEEL_CX, dy = ly - WHEEL_CY;
+    if (wheel ? dx*dx + dy*dy > WHEEL_R*WHEEL_R*1.3f :
+        h->stick_center_mode == HUD_STICK_FIXED ? dx*dx + dy*dy > (STICK_R+20)*(STICK_R+20) :
+        !inside(STICK_ZONE, lx, ly)) return 0;
+    h->steer_touch = id; h->wheel_last = atan2f(dy, dx);
+    if (!wheel && h->stick_center_mode == HUD_STICK_FIXED) {
+      h->stick_x0 = WHEEL_CX; h->stick_y0 = WHEEL_CY;
+      stick_position(h, lx, ly);
+    } else {
+      h->stick_x0 = h->stick_x = lx; h->stick_y0 = h->stick_y = ly;
+    }
+    return 1;
+  }
+  if (id != h->steer_touch) return 0;
+  if (phase == TOUCH_MOVED) {
+    if (wheel) {
+      float dx = lx-WHEEL_CX, dy = ly-WHEEL_CY;
+      float a = atan2f(dy, dx), d = a-h->wheel_last;
+      if (d > (float)M_PI) d -= 2*(float)M_PI;
+      if (d < -(float)M_PI) d += 2*(float)M_PI;
+      if (dx*dx + dy*dy > 400) h->wheel_turn += d;
+      h->wheel_last = a;
+      h->wheel_turn = fmaxf(-WHEEL_LOCK, fminf(WHEEL_LOCK, h->wheel_turn));
+      h->steer_v = h->wheel_turn / WHEEL_LOCK;
+    } else {
+      stick_position(h, lx, ly);
+    }
+  }
+  return 1;
+}
+
 void hud_touch(hud_state *h, void *id, int phase, float x, float y) {
   rect brake = h->gyro ? key(G_BRAKE, KEY_LEFT) : key(BRAKE, KEY_RIGHT);
-  rect up = key(h->gyro ? G_SHIFT_UP : SHIFT_UP, KEY_RIGHT), down = key(h->gyro ? G_SHIFT_DOWN : SHIFT_DOWN, KEY_RIGHT);
+  rect up = shift_key(h->gyro ? G_SHIFT_UP : SHIFT_UP), down = shift_key(h->gyro ? G_SHIFT_DOWN : SHIFT_DOWN);
   rect throttle = key(THROTTLE, KEY_RIGHT), left = key(LEFT, KEY_LEFT), right = key(RIGHT, KEY_LEFT);
   if (phase == TOUCH_BEGAN && keys_pause_only()) {
     if (inside(key(PAUSE, KEY_TOP), x, y)) h->pause_pressed++;
@@ -119,8 +217,12 @@ void hud_touch(hud_state *h, void *id, int phase, float x, float y) {
     else if (inside(key(TRANS, KEY_TOP), x, y)) h->trans_pressed++;
     else if (inside(key(RESET, KEY_TOP), x, y)) h->reset_pressed++;
     else if (inside(key(PAUSE, KEY_TOP), x, y)) h->pause_pressed++;
-    else if (!h->gyro && inside(left, x, y)) h->left_touch = id;
-    else if (!h->gyro && inside(right, x, y)) h->right_touch = id;
+    else if (steer_touch(h, id, phase, x, y)) {}
+    else if (!h->gyro && h->steer_mode == HUD_STEER_KEYS && inside(left, x, y)) h->left_touch = id;
+    else if (!h->gyro && h->steer_mode == HUD_STEER_KEYS && inside(right, x, y)) h->right_touch = id;
+  } else if (id && id == h->steer_touch) {
+    steer_touch(h, id, phase, x, y);
+    return;
   } else if (phase == TOUCH_MOVED) {
     /* sliding a finger between the pedals, or between left and right, switches button */
     if (id == h->throttle_touch && inside(brake, x, y)) { h->throttle_touch = 0; h->brake_touch = id; }
@@ -139,7 +241,7 @@ void hud_touch(hud_state *h, void *id, int phase, float x, float y) {
   }
 }
 
-void hud_input(hud_state *h, car_input *in) {
+void hud_input_dt(hud_state *h, car_input *in, float dt) {
   /* digital steering, car_update ramping the wheel towards it; or the iPad's turn past the
    * dead zone, full lock at h->full */
   in->steer = (h->right_touch ? 1.0f : 0.0f) - (h->left_touch ? 1.0f : 0.0f);
@@ -148,13 +250,23 @@ void hud_input(hud_state *h, car_input *in) {
     s = a <= 0 ? 0.0f : s > 1.0f ? 1.0f : s;
     in->steer = h->tilt < 0 ? -s : s;
   }
-  in->analog = h->gyro;
+  if (!h->gyro && h->steer_mode == HUD_STEER_WHEEL && !h->steer_touch && h->wheel_turn != 0) {
+    /* Limit a stalled frame; invalid or nonpositive time makes no progress. */
+    float elapsed = !isfinite(dt) || dt <= 0 ? 0 : fminf(dt, 0.1f);
+    float back = WHEEL_LOCK * (elapsed * 3.0f);
+    h->wheel_turn = fabsf(h->wheel_turn) <= back + WHEEL_LOCK * 1e-6f ? 0 : h->wheel_turn - copysignf(back, h->wheel_turn);
+    h->steer_v = h->wheel_turn / WHEEL_LOCK;
+  }
+  if (!h->gyro && (h->steer_mode == HUD_STEER_WHEEL || h->steer_mode == HUD_STEER_STICK)) in->steer = h->steer_v;
+  in->analog = h->gyro || h->steer_mode == HUD_STEER_WHEEL || h->steer_mode == HUD_STEER_STICK;
   in->throttle = h->throttle_touch ? (h->slide ? h->throttle_v : 1.0f) : 0.0f;
   in->brake = h->brake_touch ? (h->slide ? h->brake_v : 1.0f) : 0.0f;
   in->shift_up = h->shift_up > 0;
   in->shift_down = h->shift_down > 0;
   h->shift_up = h->shift_down = 0;
 }
+
+void hud_input(hud_state *h, car_input *in) { hud_input_dt(h, in, 1.0f / 60.0f); }
 
 /* ---- drawing ---- */
 
@@ -678,12 +790,14 @@ void hud_set_card(int title, const short *name) {
 
 /* glyphs of base (cells of `cell` px, drawn `out` px) from x, y (the HUD's points): their
  * advances half or full (in out's px), each glyph half if its character is ASCII */
+static void race_meter_glyph(float dst[4]);
 static void plate_glyphs(int base, const unsigned short *g, const unsigned char *half, int n, float x, float y,
                          float cell, float out, float adv_half, float adv_full) {
   const float k = HUD_K / 1.6f; /* the HUD's points over the menus' 640x480 */
   for (int i = 0; i < n; ++i) {
     int s = anm_sprite(base + g[i]);
     float src[4] = { 0, 0, cell, cell }, dst[4] = { x / 1.6f, y / 1.6f, x / 1.6f + out * k, y / 1.6f + out * k };
+    race_meter_glyph(dst);
     if (s >= 0) anm_draw_part(s, src, dst, 1);
     x += (half[i] ? adv_half : adv_full) * HUD_K;
   }
@@ -1156,6 +1270,9 @@ void hud_set_city(int city) { navi_select(city, 0); }
 
 /* The map in its window at (17, 113, 88, 82) of the arcade's GL viewport (y up), looking
  * down from 2000 over the car with its heading up, ortho -2000..2000 x -1200..2800. */
+static void race_map_rect(float *x, float *y, float *w, float *h);
+static void race_rank_anm(float *x, float *y, float *zoom);
+static void race_time_anm(float *x, float *y, float *zoom);
 static void draw_navi(const hud_state *h, const car_race *r) {
   if (!NAVI.n || navi_city < 0 || navi_city != navi_requested) return;
   if (NAVI.next != r->next_area) { /* clMiniMap::update */
@@ -1168,11 +1285,35 @@ static void draw_navi(const hud_state *h, const car_race *r) {
   glGetIntegerv(GL_VIEWPORT, vp);
   float sx = (float)vp[2] / (h->screen_w + 2 * EDGE), sy = (float)vp[3] / h->screen_h;
   float x0 = tx(17), y0 = ty(285) - MAP_UP, w = 88 * HUD_K, hh = 82 * HUD_K;
-  GLint wx = vp[0] + (GLint)((x0 + EDGE) * sx + 0.5f), wy = vp[1] + (GLint)((h->screen_h - y0 - hh) * sy + 0.5f);
-  GLsizei ww = (GLsizei)(w * sx + 0.5f), wh = (GLsizei)(hh * sy + 0.5f);
-  glViewport(wx, wy, ww, wh);
+  race_map_rect(&x0, &y0, &w, &hh);
+  /* Intersect the desired map viewport with the enclosing framebuffer viewport
+   * before calling GL. Compensate the projection below, so clipping does not
+   * squeeze the map or require negative/oversized Vulkan viewports. */
+  if (vp[2] <= 0 || vp[3] <= 0 || h->screen_h <= 0 || h->screen_w + 2*EDGE <= 0) return;
+  double wx = (double)vp[0] + floor((double)(x0 + EDGE)*sx + 0.5);
+  double wy = (double)vp[1] + floor((double)(h->screen_h-y0-hh)*sy + 0.5);
+  double ww = floor((double)w*sx + 0.5), wh = floor((double)hh*sy + 0.5);
+  if (!isfinite(wx) || !isfinite(wy) || !isfinite(ww) || !isfinite(wh) || ww <= 0 || wh <= 0) return;
+  double vx0 = fmax(wx, vp[0]), vy0 = fmax(wy, vp[1]);
+  double vx1 = fmin(wx+ww, (double)vp[0]+vp[2]), vy1 = fmin(wy+wh, (double)vp[1]+vp[3]);
+  if (vx1 <= vx0 || vy1 <= vy0) return;
+  GLint clipped[4] = {(GLint)vx0, (GLint)vy0, (GLsizei)(vx1-vx0), (GLsizei)(vy1-vy0)};
+  GLint old_sc[4], old_depth_func;
+  GLboolean old_sc_on, old_depth_on, old_depth_mask;
+  glGetIntegerv(GL_SCISSOR_BOX, old_sc);
+  glGetIntegerv(GL_DEPTH_FUNC, &old_depth_func);
+  glGetBooleanv(GL_SCISSOR_TEST, &old_sc_on);
+  glGetBooleanv(GL_DEPTH_TEST, &old_depth_on);
+  glGetBooleanv(GL_DEPTH_WRITEMASK, &old_depth_mask);
+  double scx0 = vx0, scy0 = vy0, scx1 = vx1, scy1 = vy1;
+  if (old_sc_on) {
+    scx0 = fmax(scx0, old_sc[0]); scy0 = fmax(scy0, old_sc[1]);
+    scx1 = fmin(scx1, (double)old_sc[0]+old_sc[2]); scy1 = fmin(scy1, (double)old_sc[1]+old_sc[3]);
+  }
+  if (scx1 <= scx0 || scy1 <= scy0) return;
+  glViewport(clipped[0], clipped[1], clipped[2], clipped[3]);
   glEnable(GL_SCISSOR_TEST);
-  glScissor(wx, wy, ww, wh);
+  glScissor((GLint)scx0, (GLint)scy0, (GLsizei)(scx1-scx0), (GLsizei)(scy1-scy0));
   glDepthMask(GL_TRUE);
   glClear(GL_DEPTH_BUFFER_BIT);
   glEnable(GL_DEPTH_TEST);
@@ -1182,6 +1323,13 @@ static void draw_navi(const hud_state *h, const car_race *r) {
   float fx = -sinf(r->map_angle), fz = -cosf(r->map_angle);
   const float eye[3] = { r->map_x, 2000, r->map_z }, at[3] = { r->map_x, 0, r->map_z }, up[3] = { fx, 0, fz };
   mat4 mvp = mat4_mul(mat4_ortho(-2000, 2000, -1200, 2800, 5, 10000), mat4_look_at(eye, at, up));
+  if (vx0 != wx || vy0 != wy || vx1 != wx+ww || vy1 != wy+wh) {
+    mat4 crop = mat4_identity();
+    crop.m[0] = (float)(ww/(vx1-vx0)); crop.m[5] = (float)(wh/(vy1-vy0));
+    crop.m[12] = (float)((2*(wx-vx0)+ww)/(vx1-vx0)-1);
+    crop.m[13] = (float)((2*(wy-vy0)+wh)/(vy1-vy0)-1);
+    mvp = mat4_mul(crop, mvp);
+  }
   glUseProgram(NAVI.prog);
   glUniformMatrix4fv(NAVI.u_mvp, 1, GL_FALSE, mvp.m);
   glUniform1i(NAVI.u_tex, 0);
@@ -1223,8 +1371,11 @@ static void draw_navi(const hud_state *h, const car_race *r) {
   glDisable(GL_DEPTH_TEST);
   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
-  glDepthMask(GL_TRUE);
-  glDisable(GL_SCISSOR_TEST);
+  glDepthMask(old_depth_mask);
+  glDepthFunc((GLenum)old_depth_func);
+  if (old_depth_on) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+  glScissor(old_sc[0], old_sc[1], old_sc[2], old_sc[3]);
+  if (old_sc_on) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
   glViewport(vp[0], vp[1], vp[2], vp[3]);
 }
 
@@ -1234,11 +1385,14 @@ static int ta_story;
  * place in its cons_g_R_tg (draw_rival_marks) */
 static struct { int pop, loop[3]; float phase; } mark_state[4];
 
-static int story_chara[3], story_n, story_sel = -1;
+static int story_chara[3], story_n, story_sel = -1, story_series = -1, story_ranking_slots_valid;
 static unsigned char story_shown[3];
 
-void hud_set_story_rivals(const int *chara, const unsigned char *shown, int n, int sel) {
+void hud_set_story_rivals(const int *chara, const unsigned char *shown, int n, int sel,
+                          int series, int ranking_slots_valid) {
   story_sel = sel;
+  story_series = series;
+  story_ranking_slots_valid = ranking_slots_valid != 0;
   story_n = n < 0 ? 0 : n > 3 ? 3 : n;
   for (int i = 0; i < 3; ++i) {
     story_chara[i] = i < story_n ? chara[i] : 0;
@@ -1336,9 +1490,8 @@ static void draw_info_box(int cpu, float x, int face, int name, int car_img, flo
   snprintf(text, sizeof text, "%d     ", m);
   for (int i = 0; i < 5; ++i)
     sw[n++] = (anm_swap){ anm_sprite(T_CPU_DIGIT0 + i), text[i] == ' ' ? -1 : uv(UV_CPU_DIGIT0 + text[i] - '0') };
-  const float zoom = HUD_K / 1.6f;
-  anm_draw_xf(cpu, neg ? 5 - digits : 4 + digits, 1, (1024 + EDGE - (640 - x) * HUD_K) / 1.6f, (TA_Y + 76 * HUD_K) / 1.6f,
-              zoom, sw, n);
+  float zoom = HUD_K / 1.6f, dx = (1024 + EDGE - (640 - x) * HUD_K) / 1.6f, dy = (TA_Y + 76 * HUD_K) / 1.6f;
+  anm_draw_xf(cpu, neg ? 5 - digits : 4 + digits, 1, dx, dy, zoom, sw, n);
 }
 
 static void draw_rival_info(const car_state *car, int round) {
@@ -1433,7 +1586,9 @@ static void draw_vs_place(const car_race *r) {
   sw[n++] = (anm_swap){ anm_sprite(T_PLACE_DOT), uv(UV_PLACE_DOT) };
   sw[n++] = (anm_swap){ anm_sprite(T_PLACE_M), uv(UV_PLACE_M) };
   sw[n++] = (anm_swap){ anm_sprite(T_PLACE_KM), uv(UV_PLACE_KM) };
-  anm_draw_xf(anim, frame, 1, TA_X / 1.6f, TA_Y / 1.6f, HUD_K / 1.6f, sw, n);
+  float dx = TA_X / 1.6f, dy = TA_Y / 1.6f, zoom = HUD_K / 1.6f;
+  race_rank_anm(&dx, &dy, &zoom);
+  anm_draw_xf(anim, frame, 1, dx, dy, zoom, sw, n);
 }
 
 /* a font's glyphs centred (datrums 9) on a template of a frame drawn at (dx, dy) * zoom: cells
@@ -1493,7 +1648,7 @@ static void draw_vs_box(int i, float gap) {
   for (int k = 0; k < 5; ++k)
     sw[n++] = (anm_swap){ anm_sprite(T_CPU_DIGIT0 + k), text[k] == ' ' ? -1 : uv(UV_CPU_DIGIT0 + text[k] - '0') };
   int frame = neg ? 5 - digits : 4 + digits;
-  const float zoom = HUD_K / 1.6f, dx = (1024 + EDGE - (640 - VS_BOX_X[i]) * HUD_K) / 1.6f, dy = (TA_Y + 60 * HUD_K) / 1.6f;
+  float zoom = HUD_K / 1.6f, dx = (1024 + EDGE - (640 - VS_BOX_X[i]) * HUD_K) / 1.6f, dy = (TA_Y + 60 * HUD_K) / 1.6f;
   anm_draw_xf(a, frame, 1, dx, dy, zoom, sw, n);
   /* the name (font 1: the menus' font 5 glyphs down to its 20-pixel cells, advances 8 and 16)
    * and the title (font 0: font 1's down to 15, advances 7 and 11), as the plate has them */
@@ -1611,7 +1766,9 @@ static void draw_mark(const car_state *car, const rival_mark *m, int lead) {
     for (int i = 0; i < 3; ++i) q[k][i] /= q[k][3];
   }
   float x = q[1][0], y = q[1][1], z = q[1][2], adv = m->adv;
-  float sx = 320.0f + 320.0f * x, sy = 240.0f - 240.0f * y;
+  /* Project onto the whole wide viewport, not just its central 4:3 area. */
+  float half_w = 320.0f + anm_edge() * (640.0f / 1024.0f);
+  float sx = 320.0f + half_w * x, sy = 240.0f - 240.0f * y;
   int band = (int)(fabsf(adv) * 5e-5f);
   if (band < 0) band = 0;
   if (band > 2) band = 2;
@@ -1629,7 +1786,7 @@ static void draw_mark(const car_state *car, const rival_mark *m, int lead) {
   }
   typeof(mark_state[0]) *st = &mark_state[m->mark];
   if (x > -1 && x < 1 && y > -1 && y < 1 && z > -1 && z < 1) {
-    float scale = (q[2][0] - q[0][0]) * 100.0f;
+    float scale = (q[2][0] - q[0][0]) * 100.0f * (half_w / 320.0f);
     scale = scale < 0 ? 0 : scale > 1.8f ? 1.8f : scale;
     int f;
     if (!m->tg) {
@@ -1649,8 +1806,8 @@ static void draw_mark(const car_state *car, const rival_mark *m, int lead) {
       if (m->name) mark_name(a, f, m->name, sx, sy, scale);
     }
   } else {
-    float mx = 640.0f - sx;
-    mx = mx < R_HALF_W ? R_HALF_W : mx > 640 - R_HALF_W ? 640 - R_HALF_W : mx;
+    float mx = 640.0f - sx, lo = 320.0f - half_w + R_HALF_W, hi = 320.0f + half_w - R_HALF_W;
+    mx = mx < lo ? lo : mx > hi ? hi : mx;
     float scale = (1.5f + 1.0f - fabsf(adv) / 150000.0f) * 0.4f;
     int f = st->loop[band]++ % (int)MARK_LOOP[band];
     if (m->tg) f += MARK_TG[m->mark];
@@ -1899,18 +2056,28 @@ static int demo_cut_anim(int which, int kind) {
  * Duration, hit choice, queueing and placement are conservative port policies, not claims
  * about the original scheduler. FacePos_Left and Way_Right coexist in the data; their
  * independent positioning semantics are unknown, so FacePos is not guessed or mirrored.
- * Each row is consumed at most once per race. */
+ * Presented rows are deduplicated across an explicitly continuous story chain;
+ * result rows are reset per period. This is a port policy, not original scheduling. */
 #define STORY_CUT_N ((int)STORY_CUTIN_RECORD_COUNT)
 static struct {
   int episode, active, started, finished, hit_on, current, age, qhead, qtail;
+  int select, loop;
   const char *variant;
-  unsigned char used[STORY_CUTIN_RECORD_COUNT];
+  unsigned char queued[STORY_CUTIN_RECORD_COUNT], presented[STORY_CUTIN_RECORD_COUNT];
   int queue[STORY_CUTIN_RECORD_COUNT];
   cut_anime flash, serifu;
 } story_cut;
 
-void hud_story_cutin_start(int select, int loop) {
+void hud_story_cutin_period(int select, int loop, int continuous) {
+  unsigned char shown[STORY_CUTIN_RECORD_COUNT] = {0};
+  if (continuous && story_cut.active && story_cut.select == select && story_cut.loop == loop) {
+    for (int i = 0; i < STORY_CUT_N; ++i)
+      if (strcmp(STORY_CUTIN_RECORDS[i].event, "ECutInWin") &&
+          strcmp(STORY_CUTIN_RECORDS[i].event, "ECutInLose")) shown[i] = story_cut.presented[i];
+  }
   memset(&story_cut, 0, sizeof story_cut);
+  memcpy(story_cut.presented, shown, sizeof shown);
+  story_cut.select = select; story_cut.loop = loop;
   story_cut.current = -1;
   story_cut.flash.anim = story_cut.serifu.anim = -1;
   if (select < 0 || select > 110 || loop < 0 || (select >= 100 && loop == 0)) return;
@@ -1925,19 +2092,39 @@ void hud_story_cutin_start(int select, int loop) {
   story_cut.active = 1;
 }
 
+void hud_story_cutin_start(int select, int loop) { hud_story_cutin_period(select, loop, 0); }
+
+/* The app calls this only for a confirmed continuing intermediate period.
+ * Do not show the episode's final result line before the actual result; it
+ * would be enqueued again when the next period ends. Keep presentation history
+ * of the race dialogue so a continuous period cannot repeat it. */
+void hud_story_cutin_suspend(void) {
+  if (!story_cut.active || story_cut.finished || ten_level >= 0) return;
+  story_cut.finished = 1;
+  memset(story_cut.queued, 0, sizeof story_cut.queued);
+  story_cut.qhead = story_cut.qtail = 0;
+  story_cut.current = -1;
+  story_cut.flash.anim = story_cut.serifu.anim = -1;
+}
+
 static int story_cut_match(const StoryCutinRecord *r) {
   return r->episode == story_cut.episode && !strcmp(r->variant, story_cut.variant);
 }
 static void story_cut_queue(int i) {
-  if (!story_cut.used[i] && story_cut.qtail < STORY_CUT_N) {
-    story_cut.used[i] = 1;
+  if (story_cut.qtail == STORY_CUT_N && story_cut.qhead > 0) {
+    int n = story_cut.qtail - story_cut.qhead;
+    memmove(story_cut.queue, story_cut.queue + story_cut.qhead, (size_t)n * sizeof story_cut.queue[0]);
+    story_cut.qhead = 0; story_cut.qtail = n;
+  }
+  if (!story_cut.queued[i] && !story_cut.presented[i] && story_cut.qtail < STORY_CUT_N) {
+    story_cut.queued[i] = 1;
     story_cut.queue[story_cut.qtail++] = i;
   }
 }
 static void story_cut_event(const char *event, int first_only) {
   for (int i = 0; i < STORY_CUT_N; ++i) {
     const StoryCutinRecord *r = &STORY_CUTIN_RECORDS[i];
-    if (story_cut_match(r) && !story_cut.used[i] && !strcmp(r->event, event)) {
+    if (story_cut_match(r) && !story_cut.queued[i] && !story_cut.presented[i] && !strcmp(r->event, event)) {
       story_cut_queue(i);
       if (first_only) break;
     }
@@ -1952,7 +2139,8 @@ void hud_story_cutin_step(const car_race *r, int hit) {
   if (!story_cut.finished && r->over) {
     story_cut.finished = 1;
     /* Do not bury the result behind a backlog accumulated at closely spaced thresholds. */
-    story_cut.qhead = story_cut.qtail;
+    memset(story_cut.queued, 0, sizeof story_cut.queued);
+    story_cut.qhead = story_cut.qtail = 0;
     story_cut.current = -1;
     story_cut.flash.anim = story_cut.serifu.anim = -1;
     story_cut_event(r->won ? "ECutInWin" : "ECutInLose", 0);
@@ -1962,7 +2150,7 @@ void hud_story_cutin_step(const car_race *r, int hit) {
     if (r->story_distance_valid && isfinite(r->story_distance)) {
       for (int i = 0; i < STORY_CUT_N; ++i) {
         const StoryCutinRecord *v = &STORY_CUTIN_RECORDS[i];
-        if (!story_cut.used[i] && story_cut_match(v) && !strncmp(v->event, "ECutInRace", 10)) {
+        if (!story_cut.queued[i] && !story_cut.presented[i] && story_cut_match(v) && !strncmp(v->event, "ECutInRace", 10)) {
           char *end;
           float at = strtof(v->key, &end);
           if (end != v->key && !*end && isfinite(at) && r->story_distance >= at) story_cut_queue(i);
@@ -1987,6 +2175,7 @@ void hud_story_cutin_step(const car_race *r, int hit) {
       snd_menu(SND_TURN3_CUTIN);
     } else if (age == 140) cut_play(&story_cut.serifu, story_cut.serifu.anim, 61, 9);
     else if (age >= 150) {
+      story_cut.queued[story_cut.current] = 0;
       story_cut.current = -1;
       story_cut.flash.anim = story_cut.serifu.anim = -1;
     }
@@ -1994,6 +2183,26 @@ void hud_story_cutin_step(const car_race *r, int hit) {
     if (story_cut.serifu.anim >= 0) story_cut.serifu.t++;
   }
 }
+
+/* The port plays result rows serially. Keep the goal picture frozen long enough
+ * for that bounded queue rather than cutting its second row short. This is not
+ * a claim that the arcade schedules its cut-ins serially. Never wait on a draw
+ * or a GPU observation: missing sprites and suspended rendering cannot create
+ * an unbounded result hold. */
+int hud_story_cutin_goal_hold(const car_race *r) {
+  enum { MIN_HOLD = 180, MAX_HOLD = 600, ROW_TICKS = 150 };
+  if (story_cut.active && ten_level < 0 && !story_cut.finished && r && r->over)
+    hud_story_cutin_step(r, 0);
+  if (!story_cut.active || !story_cut.finished || ten_level >= 0) return MIN_HOLD;
+  int queued = story_cut.qtail - story_cut.qhead;
+  if (queued < 0) return MIN_HOLD;
+  if (queued >= MAX_HOLD / ROW_TICKS) return MAX_HOLD;
+  int current = story_cut.current >= 0 && story_cut.age < ROW_TICKS
+                  ? ROW_TICKS - (story_cut.age > 0 ? story_cut.age : 0) : 0;
+  int remaining = current + queued * ROW_TICKS;
+  return remaining < MIN_HOLD ? MIN_HOLD : remaining > MAX_HOLD ? MAX_HOLD : remaining;
+}
+
 void hud_story_cutin_draw(void) {
   if (!story_cut.active || ten_level >= 0 || story_cut.current < 0) return;
   const StoryCutinRecord *v = &STORY_CUTIN_RECORDS[story_cut.current];
@@ -2006,12 +2215,15 @@ void hud_story_cutin_draw(void) {
   int frame = cut_frame(&story_cut.serifu);
   anm_swap base[2] = { { face_template, face }, { text_template, -1 } };
   anm_draw_ex(story_cut.serifu.anim, frame, 1, 0, CUT_Y, base, 2);
-  if (text >= 0) {
+  if (text >= 0 && text_template >= 0 && frame >= 0 && frame < anm_frames(story_cut.serifu.anim)) {
     int w = (int)anm_sprite_width(text) - CUT_CELL;
     anm_swap only[2] = { { face_template, -1 }, { text_template, text } };
     /* Both orientations use their own anime's text anchor. */
     (void)way;
     anm_draw_ex(story_cut.serifu.anim, frame, 1, (float)((CUT_CELL - w) / 2 + (CUT_FULL - CUT_CELL) / 2), CUT_Y, only, 2);
+    /* The steady text phase has been submitted for drawing, not just queued.
+     * The renderer cannot report actual screen visibility or GPU success. */
+    if (story_cut.age >= 20) story_cut.presented[story_cut.current] = 1;
   }
 }
 
@@ -2159,7 +2371,7 @@ static void draw_ten(const car_state *car) {
   const car_race *r = &car->race;
   if (ten_level < 0 || men < 0 || split < 0 || r->state != CAR_RACE_RUN) return;
   if (!ten_disp) return;
-  const float zoom = HUD_K / 1.6f, dx = TA_X / 1.6f, dy = TA_Y / 1.6f;
+  float zoom = HUD_K / 1.6f, dx = TA_X / 1.6f, dy = TA_Y / 1.6f;
   int extend = ten_level >= 10, max = extend ? 31 : 9;
   int round = r->ten_beaten < 0 ? 0 : r->ten_beaten > max ? max : r->ten_beaten;
   if (round != ten_round) {
@@ -2186,8 +2398,11 @@ static void draw_ten(const car_state *car) {
   }
   sw[n++] = (anm_swap){ anm_sprite(T_PLACE4), uv(UV_PLACE0 + (shown % 10 == 0 ? 9 : shown % 10 - 1)) };
   sw[n++] = (anm_swap){ anm_sprite(T_PLACE3), uv(UV_PLACE0 + (shown / 10 % 10 == 0 ? 9 : shown / 10 % 10 - 1)) };
-  anm_draw_xf(men, shown <= 9 ? 4 : 9, 1, dx, dy, zoom, sw, n);
+  float rank_x = dx, rank_y = dy, rank_zoom = zoom;
+  race_rank_anm(&rank_x, &rank_y, &rank_zoom);
+  anm_draw_xf(men, shown <= 9 ? 4 : 9, 1, rank_x, rank_y, rank_zoom, sw, n);
   /* cons_g_splittime: rows 0..3, the last four of the rivals so far */
+  race_time_anm(&dx, &dy, &zoom);
   int first = ten_round > 3 ? ten_round - 3 : 0;
   for (int k = first; k <= ten_round; ++k) { /* getInfoTenClearTime: the one on the road's runs */
     anm_swap ts[8];
@@ -2196,23 +2411,211 @@ static void draw_ten(const car_state *car) {
   draw_rival_info(car, ten_round);
 }
 
+/* Race consoles use a shared logical-screen affine; the texture projection,
+ * animation coordinates and navi viewport each consume that same transform. */
+static float race_k[HUD_RACE_GROUPS] = {1,1,1,1}, race_dx[HUD_RACE_GROUPS], race_dy[HUD_RACE_GROUPS];
+static rect race_meter_bounds(void) {
+  /* Plate includes the speed digits, unit, class, card text and tune details.
+   * A fallback keeps the editor usable before hud.bin has been loaded. */
+  float pw = SPR[SPR_PLATE].w > 0 ? SPR[SPR_PLATE].w : 200;
+  float ph = fmaxf(SPR[SPR_PLATE].h, 64);
+  float left = 1024 + EDGE - pw*HUD_K, top = INFO_Y;
+  float right = left + fmaxf(pw, 190)*HUD_K, bottom = top + ph*HUD_K;
+  if (meter_car) {
+    int night = meter_night;
+    int count = meter_v2_active ? METERDB_V2[meter_car-METERDB].n[night] : meter_car->n[night];
+    if (count > METERDB_MAX_PARTS) count = METERDB_MAX_PARTS;
+    for (int i = 0; i < count; ++i) {
+      const meterdb_part *p = meter_v2_active ? &METERDB_V2[meter_car-METERDB].parts[night][i] : &meter_car->parts[night][i];
+      const hud_sprite *sp = &METER[i];
+      if (!sp->tex) continue;
+      float cx = CLUSTER_X + (p->x-560)*HUD_K, cy = CLUSTER_Y + (p->y-228)*HUD_K;
+      float sw = sp->w, sh = sp->h;
+      if (i == racing_lamp_slot && racing_lamp_on.tex) {
+        sw = fmaxf(sw, racing_lamp_on.w); sh = fmaxf(sh, racing_lamp_on.h);
+      }
+      float hw = sw*HUD_K*0.5f, hh = sh*HUD_K*0.5f, ex, ey;
+      if (p->a1 != 0) ex = ey = hypotf(hw, hh);
+      else {
+        float a = p->a0*(float)M_PI/180.0f, c = fabsf(cosf(a)), s = fabsf(sinf(a));
+        ex = hw*c + hh*s; ey = hw*s + hh*c;
+      }
+      left = fminf(left, cx-ex); right = fmaxf(right, cx+ex);
+      top = fminf(top, cy-ey); bottom = fmaxf(bottom, cy+ey);
+    }
+  } else {
+    left = fminf(left, CLUSTER_X-175); right = fmaxf(right, CLUSTER_X+55);
+    top = fminf(top, CLUSTER_Y-125); bottom = fmaxf(bottom, CLUSTER_Y+145);
+  }
+  return (rect){left, top, right-left, bottom-top};
+}
+static rect race_bounds(int g) {
+  switch (g) {
+    case HUD_RACE_MAP: {
+      /* Include the actual road viewport as well as the frame and either
+       * course/story name; uploaded sprite sizes vary across asset packs. */
+      float left = tx(15), top = ty(262)-MAP_UP;
+      float right = tx(17 + 88), bottom = ty(285 + 82)-MAP_UP;
+      int ids[] = {SPR_MAP_WAKU, SPR_MAP_NAME, SPR_MAP_TEXT};
+      int counts[] = {1, CAR_COURSES, 19};
+      for (int j=0; j<3; ++j) for (int i=0; i<counts[j]; ++i) {
+        const hud_sprite *sp = &SPR[ids[j]+i];
+        if (!sp->tex) continue;
+        right = fmaxf(right, tx(15)+sp->w*HUD_K);
+        bottom = fmaxf(bottom, ty(j ? 266 : 262)-MAP_UP+sp->h*HUD_K);
+      }
+      return (rect){left, top, right-left, bottom-top};
+    }
+    case HUD_RACE_RANK: return (rect){TA_X, TA_Y, 205, 90};
+    case HUD_RACE_TIME: {
+      float top = fminf(ty(85), ty(364)-MAP_UP);
+      float bottom = fmaxf(ty(225), ty(390)-MAP_UP);
+      return (rect){TA_X - 31, top, 175, bottom-top};
+    }
+    default: return race_meter_bounds();
+  }
+}
+void hud_race_layout_set(int g, float k, float dx, float dy) {
+  if (g < 0 || g >= HUD_RACE_GROUPS || !isfinite(k) || !isfinite(dx) || !isfinite(dy)) return;
+  race_k[g] = fmaxf(0.6f, fminf(1.6f, k)); race_dx[g] = dx; race_dy[g] = dy;
+}
+/* Pivot is independent of the current car and loaded sprite dimensions: the
+ * same saved transform must not jump when race assets replace the preview. */
+static void race_pivot(int g, float *x, float *y) {
+  if (g == HUD_RACE_METER) { *x = CLUSTER_X; *y = CLUSTER_Y; }
+  else if (g == HUD_RACE_MAP) { *x = tx(60); *y = ty(315)-MAP_UP; }
+  else { *x = TA_X; *y = TA_Y; }
+}
+static rect race_place_rect(int g, rect r, float k, float dx, float dy) {
+  float x, y; race_pivot(g, &x, &y);
+  return (rect){x + (r.x-x)*k + dx, y + (r.y-y)*k + dy, r.w*k, r.h*k};
+}
+static rect race_placed(int g, float k, float dx, float dy) {
+  return race_place_rect(g, race_bounds(g), k, dx, dy);
+}
+static rect race_time_region(int region) {
+  if (region == 0) return (rect){TA_X-31, ty(85), 175, ty(225)-ty(85)};
+  return (rect){TA_X-31, ty(364)-MAP_UP, 175, ty(390)-ty(364)};
+}
+int hud_race_layout_hit(float x, float y) {
+  /* TIME's bounding box also spans the empty gap containing the minimap.
+   * Give an actual map overlap priority, then hit-test only the two visible
+   * time regions in their original coordinates. The editor's PREV/NEXT and
+   * panel handle still allow access to any completely overlapping group. */
+  if (inside(race_placed(HUD_RACE_MAP, race_k[HUD_RACE_MAP], race_dx[HUD_RACE_MAP], race_dy[HUD_RACE_MAP]), x, y))
+    return HUD_RACE_MAP;
+  for (int g = HUD_RACE_GROUPS - 1; g >= 0; --g) {
+    if (g == HUD_RACE_MAP) continue;
+    if (g == HUD_RACE_TIME) {
+      float px, py; race_pivot(g, &px, &py);
+      float lx = px + (x-px-race_dx[g])/race_k[g];
+      float ly = py + (y-py-race_dy[g])/race_k[g];
+      if (inside(race_time_region(0), lx, ly) || inside(race_time_region(1), lx, ly)) return g;
+    } else if (inside(race_placed(g, race_k[g], race_dx[g], race_dy[g]), x, y)) return g;
+  }
+  return -1;
+}
+float hud_race_layout_max_scale(int g) {
+  if (g < 0 || g >= HUD_RACE_GROUPS) return 1.0f;
+  rect r = race_bounds(g);
+  if (!(r.w > 0 && r.h > 0)) return 1.0f;
+  return fmaxf(0.6f, fminf(1.6f, fminf((1024+2*EDGE)/r.w, 768/r.h)));
+}
+void hud_race_layout_clamp(int g, float k, float *dx, float *dy) {
+  if (g < 0 || g >= HUD_RACE_GROUPS || !dx || !dy || !isfinite(k) || !isfinite(*dx) || !isfinite(*dy)) return;
+  k = fmaxf(0.6f, fminf(1.6f, k));
+  rect r = race_placed(g, k, 0, 0);
+  /* Oversized legacy values cannot fit; center on that axis instead of
+   * spuriously claiming that either edge is clamped. */
+  *dx = r.w > 1024+2*EDGE ? 512-r.x-r.w/2 : fmaxf(-EDGE-r.x, fminf(1024+EDGE-r.x-r.w, *dx));
+  *dy = r.h > 768 ? 384-r.y-r.h/2 : fmaxf(-r.y, fminf(768-r.y-r.h, *dy));
+}
+void hud_draw_race_layout(float w, float h, int sel) {
+  hud_ui_begin(w, h);
+  for (int g = 0; g < HUD_RACE_GROUPS; ++g) for (int region = 0; region < (g == HUD_RACE_TIME ? 2 : 1); ++region) {
+    rect r = g == HUD_RACE_TIME ? race_place_rect(g, race_time_region(region), race_k[g], race_dx[g], race_dy[g])
+                               : race_placed(g, race_k[g], race_dx[g], race_dy[g]);
+    hud_ui_rect(r.x, r.y, r.w, r.h, 0.08f, 0.12f, 0.18f, 0.5f);
+    float cr = g == sel ? 1.0f : 0.7f, cg = g == sel ? 0.5f : 0.8f;
+    hud_ui_rect(r.x, r.y, r.w, 2, cr, cg, 0.3f, 1);
+    hud_ui_rect(r.x, r.y+r.h-2, r.w, 2, cr, cg, 0.3f, 1);
+    hud_ui_rect(r.x, r.y, 2, r.h, cr, cg, 0.3f, 1);
+    hud_ui_rect(r.x+r.w-2, r.y, 2, r.h, cr, cg, 0.3f, 1);
+    static const char *label[] = {"MAP", "RANK", "TIME", "METER"};
+    hud_ui_text(label[g], r.x+5, r.y+5, 2, 1, 1, 1, 1);
+  }
+  hud_ui_end();
+}
+static void race_map_rect(float *x, float *y, float *w, float *h) {
+  float k = race_k[HUD_RACE_MAP], px, py;
+  if (k == 1 && race_dx[HUD_RACE_MAP] == 0 && race_dy[HUD_RACE_MAP] == 0) return;
+  race_pivot(HUD_RACE_MAP, &px, &py);
+  *x = px + (*x-px)*k + race_dx[HUD_RACE_MAP];
+  *y = py + (*y-py)*k + race_dy[HUD_RACE_MAP];
+  *w *= k; *h *= k;
+}
+static void race_meter_glyph(float dst[4]) {
+  int g = HUD_RACE_METER; float k = race_k[g], x, y;
+  if (k == 1 && race_dx[g] == 0 && race_dy[g] == 0) return;
+  race_pivot(g, &x, &y);
+  for (int i = 0; i < 4; i += 2) {
+    dst[i] = (x + (dst[i]*1.6f-x)*k + race_dx[g])/1.6f;
+    dst[i+1] = (y + (dst[i+1]*1.6f-y)*k + race_dy[g])/1.6f;
+  }
+}
+static void race_anm(int g, float *x, float *y, float *zoom) {
+  float k = race_k[g], px, py;
+  if (k == 1 && race_dx[g] == 0 && race_dy[g] == 0) return;
+  race_pivot(g, &px, &py);
+  *x = (px + (*x*1.6f-px)*k + race_dx[g])/1.6f;
+  *y = (py + (*y*1.6f-py)*k + race_dy[g])/1.6f;
+  *zoom *= k;
+}
+static void race_rank_anm(float *x, float *y, float *zoom) { race_anm(HUD_RACE_RANK, x, y, zoom); }
+static void race_time_anm(float *x, float *y, float *zoom) { race_anm(HUD_RACE_TIME, x, y, zoom); }
+typedef struct { int active; mat4 original; } race_view;
+static race_view race_view_begin(int g, const hud_state *h) {
+  race_view s = {0, screen_ortho(h->screen_w, h->screen_h)};
+  float k = race_k[g];
+  if (k == 1 && race_dx[g] == 0 && race_dy[g] == 0) return s;
+  float x, y; race_pivot(g, &x, &y); mat4 affine = mat4_identity();
+  affine.m[0] = affine.m[5] = k;
+  affine.m[12] = (1-k)*x + race_dx[g];
+  affine.m[13] = (1-k)*y + race_dy[g];
+  mat4 p = mat4_mul(s.original, affine);
+  glUseProgram(tex_prog); glUniformMatrix4fv(u_tproj, 1, GL_FALSE, p.m);
+  s.active = 1; return s;
+}
+static void race_view_end(race_view s) {
+  if (s.active) { glUseProgram(tex_prog); glUniformMatrix4fv(u_tproj, 1, GL_FALSE, s.original.m); }
+}
+
 static void draw_ta(const hud_state *h, const car_state *car, const mat4 *proj) {
   const car_race *r = &car->race;
   if (!SPR[SPR_TILL_GOAL].tex) return;
   glEnableVertexAttribArray(1);
   if (ten_level < 0 && !vs_n) {
+    race_view v = race_view_begin(HUD_RACE_RANK, h);
     draw_till_goal(r->remain);
+    race_view_end(v);
+    v = race_view_begin(HUD_RACE_TIME, h);
     draw_times(r);
+    race_view_end(v);
   }
+  race_view map = race_view_begin(HUD_RACE_MAP, h);
   map_blit(SPR_MAP_WAKU, 15, 262);
   draw_navi(h, r);
   glUseProgram(tex_prog);
   glUniformMatrix4fv(u_tproj, 1, GL_FALSE, proj->m);
+  if (map.active) (void)race_view_begin(HUD_RACE_MAP, h);
   glEnableVertexAttribArray(1);
   /* the black box over the map: the course's name, in a story race the road's (S2DInfoMap +0x14) */
   if (!ta_story && ta_course >= 0 && ta_course < CAR_COURSES) map_blit(SPR_MAP_NAME + ta_course, 15, 266);
   if (ta_story && r->map_text >= 1 && r->map_text <= 19) map_blit(SPR_MAP_TEXT + r->map_text - 1, 15, 266);
+  race_view_end(map);
+  race_view time = race_view_begin(HUD_RACE_TIME, h);
   draw_time_left(r->time_left);
+  race_view_end(time);
   if (!ta_story && ten_level < 0) draw_records();
   draw_sign(r);
   if (r->state == CAR_RACE_RUN) draw_time_extend(r->total);
@@ -2396,20 +2799,49 @@ static void draw_keys(const hud_state *h, float steer, int all_keys) {
     rect brake = h->gyro ? G_BRAKE : BRAKE, up = h->gyro ? G_SHIFT_UP : SHIFT_UP, down = h->gyro ? G_SHIFT_DOWN : SHIFT_DOWN;
     mat4 side_proj = key_ortho(h->screen_w, h->screen_h, KEY_LEFT);
     glUniformMatrix4fv(u_proj, 1, GL_FALSE, side_proj.m);
-    if (!h->gyro) {
+    if (!h->gyro && h->steer_mode == HUD_STEER_WHEEL) {
+      /* a wheel: rim, hub and three spokes turned by the wheel's turn, the top's mark orange */
+      float a = h->wheel_turn, cx = WHEEL_CX, cy = WHEEL_CY;
+      color(0.04f, 0.05f, 0.08f, 0.45f);
+      disc(cx, cy, WHEEL_R);
+      color(0.85f, 0.88f, 0.92f, h->steer_touch ? 0.95f : 0.65f);
+      ring(cx, cy, WHEEL_R - 18, WHEEL_R);
+      disc(cx, cy, 22);
+      for (int k = 0; k < 3; ++k) {
+        float sa = a + (k == 0 ? (float)M_PI : k == 1 ? 0.0f : (float)M_PI / 2.0f), c = cosf(sa), sn = sinf(sa);
+        float px = -sn * 7, py = c * 7, r0 = 20, r1 = WHEEL_R - 16;
+        triangle(cx + c * r0 + px, cy + sn * r0 + py, cx + c * r1 + px, cy + sn * r1 + py, cx + c * r0 - px, cy + sn * r0 - py);
+        triangle(cx + c * r1 + px, cy + sn * r1 + py, cx + c * r1 - px, cy + sn * r1 - py, cx + c * r0 - px, cy + sn * r0 - py);
+      }
+      color(1.0f, 0.42f, 0.05f, 0.95f);
+      float ta = a - (float)M_PI / 2.0f;
+      disc(cx + cosf(ta) * (WHEEL_R - 9), cy + sinf(ta) * (WHEEL_R - 9), 9);
+    } else if (!h->gyro && h->steer_mode == HUD_STEER_STICK) {
+      /* the stick: its base and knob where the thumb is, else a faint ring where it waits */
+      float bx = h->steer_touch ? h->stick_x0 : WHEEL_CX, by = h->steer_touch ? h->stick_y0 : WHEEL_CY;
+      float kx = h->steer_touch ? h->stick_x : bx, ky = h->steer_touch ? h->stick_y : by;
+      color(0.04f, 0.05f, 0.08f, h->steer_touch ? 0.45f : 0.25f);
+      disc(bx, by, STICK_R + 20);
+      color(0.85f, 0.88f, 0.92f, h->steer_touch ? 0.8f : 0.35f);
+      ring(bx, by, STICK_R + 16, STICK_R + 20);
+      color(h->steer_touch ? 1.0f : 0.85f, h->steer_touch ? 0.42f : 0.88f, h->steer_touch ? 0.05f : 0.92f, h->steer_touch ? 0.9f : 0.5f);
+      disc(kx, ky, 38);
+    } else if (!h->gyro) {
       button(LEFT, h->left_touch != 0);
       button(RIGHT, h->right_touch != 0);
       color(1, 1, 1, 0.92f);
       chevron(LEFT.x + LEFT.w / 2 - 6, LEFT.y + LEFT.h / 2, 30, -1, 0);
       chevron(RIGHT.x + RIGHT.w / 2 + 6, RIGHT.y + RIGHT.h / 2, 30, 1, 0);
     }
-    /* wheel angle bar between the two */
-    float mid = (LEFT.x + RIGHT.x + RIGHT.w) / 2;
-    color(0, 0, 0, 0.4f);
-    fill_rect(LEFT.x, LEFT.y - 14, RIGHT.x + RIGHT.w - LEFT.x, 6);
-    color(1.0f, 0.42f, 0.05f, 0.95f);
-    if (steer > 0) fill_rect(mid, LEFT.y - 14, steer * (mid - LEFT.x), 6);
-    else fill_rect(mid + steer * (mid - LEFT.x), LEFT.y - 14, -steer * (mid - LEFT.x), 6);
+    /* wheel angle bar between the two (the stick's above its zone; the wheel shows its own) */
+    float mid = (LEFT.x + RIGHT.x + RIGHT.w) / 2, by = h->steer_mode == HUD_STEER_STICK ? STICK_ZONE.y - 14 : LEFT.y - 14;
+    if (h->steer_mode != HUD_STEER_WHEEL) {
+      color(0, 0, 0, 0.4f);
+      fill_rect(LEFT.x, by, RIGHT.x + RIGHT.w - LEFT.x, 6);
+      color(1.0f, 0.42f, 0.05f, 0.95f);
+      if (steer > 0) fill_rect(mid, by, steer * (mid - LEFT.x), 6);
+      else fill_rect(mid + steer * (mid - LEFT.x), by, -steer * (mid - LEFT.x), 6);
+    }
 
     /* pedals: ribbed pads, throttle tall and narrow like the cabinet's (the gyro's brake on the left) */
     if (h->gyro) {
@@ -2432,6 +2864,15 @@ static void draw_keys(const hud_state *h, float steer, int all_keys) {
       if (!h->gyro) pedal_bar(brake, h->brake_touch ? h->brake_v : 0);
     }
 
+    /* Shift uses the same right-side anchor, with an optional independent affine. */
+    if (shift_separate) {
+      rect origin = shift_key((rect){0, 0, 1, 1});
+      mat4 m = mat4_identity();
+      m.m[0] = m.m[5] = origin.w;
+      m.m[12] = origin.x; m.m[13] = origin.y;
+      side_proj = mat4_mul(screen_ortho(h->screen_w, h->screen_h), m);
+      glUniformMatrix4fv(u_proj, 1, GL_FALSE, side_proj.m);
+    }
     /* shift up / down */
     button(up, 0);
     button(down, 0);
@@ -2458,20 +2899,71 @@ static void draw_keys(const hud_state *h, float steer, int all_keys) {
   fill_rect(PAUSE.x + 27, PAUSE.y + 13, 6, 22);
 }
 
-/* Port extension: every race mode uses the player's distance only. The original
- * gates modes 4/5/8 on the nearest competitor at 700m; this is not that rule.
- * Frames 150/30 are steady authored frames, not an inferred animation clock:
- * pause and race reset cannot leave a stale countdown. */
-int hud_finish_metres(int play_state, float remain) {
-  if (play_state != 2 || !isfinite(remain) || remain < 0.0f || remain > 700.0f) return -1;
-  return (int)remain;
+/* -1 unknown/hidden; otherwise the leader's metres and independent rank flag.
+ * Non-ranking story slots are excluded explicitly; an unavailable competing
+ * opponent is unknown, never assumed behind. */
+int hud_finish_result(const car_race *r, int story, int count, unsigned story_excluded,
+                      int ten, int versus, int *trailing) {
+  if (!trailing) return -1;
+  *trailing = 0;
+  if (!r || r->play_state != 2 || !r->remain_valid || !isfinite(r->remain) || r->remain < 0) return -1;
+  float lead = r->remain;
+  int behind = 0;
+  if (ten) {
+    if (!r->ten_gap_valid || !isfinite(r->ten_gap)) return -1;
+    if (r->ten_gap < 0) { lead += r->ten_gap; behind = 1; }
+  } else if (versus) {
+    if (count < 1 || count > CAR_RIVALS) return -1;
+    for (int i = 0; i < count; ++i) {
+      float gap = r->vs_gap[i];
+      if (!r->vs_fresh[i] || !isfinite(gap)) return -1;
+      if (gap < 0) { float distance = r->remain + gap; if (!isfinite(distance)) return -1;
+        if (distance < lead) lead = distance; behind = 1; }
+    }
+  } else if (story) {
+    if (count < 1 || count > CAR_RIVALS) return -1;
+    for (int i = 0; i < count; ++i) {
+      if (story_excluded & (1u << i)) continue;
+      float gap = r->story_gap[i];
+      /* The arcade uses the advantage independently of PictureIsOn. A hidden
+       * but competing car still counts; an unwritten value must not be guessed. */
+      if (!r->story_gap_valid[i] || !isfinite(gap)) return -1;
+      if (gap < 0) { float distance = r->remain + gap; if (!isfinite(distance)) return -1;
+        if (distance < lead) lead = distance; behind = 1; }
+    }
+  }
+  if (!isfinite(lead) || lead > 600.0f) return -1;
+  *trailing = behind;
+  return lead <= 0.0f ? 0 : (int)lead;
 }
 
 static void draw_finish_remaining(const car_race *r) {
-  if (!r->remain_valid) return; /* raw upstream distance, before fmaxf sanitization */
-  int metres = hud_finish_metres(r->play_state, r->remain);
+  /* Recheck wall-clock freshness even if physics is paused and r is unchanged. */
+  for (int i = 0; i < vs_n; ++i)
+    if (!car_link_observation_fresh(r->vs_pcb[i], r->vs_observed[i])) return;
+  /* Failed model selection can compress physics slots; do not rank them using
+   * the uncompressed story-character mapping. Other HUD elements are unchanged. */
+  if (ta_story && !vs_n && ten_level < 0 && !story_ranking_slots_valid) return;
+  /* clInfoMessage treats these original irregular characters as non-ranking:
+   * their candidate is player distance +100m. Exclusion from the minimum is
+   * equivalent. This character-based check is distinct from the rival-mark table. */
+  static const int non_ranking[] = {40, 95, 124, 165, 168, 183, 185, 196, 205, 207, 212};
+  unsigned story_excluded = 0;
+  for (int slot = 0; slot < story_n && slot < CAR_RIVALS; ++slot) {
+    for (unsigned i = 0; i < sizeof non_ranking / sizeof non_ranking[0]; ++i)
+      if (story_chara[slot] == non_ranking[i]) story_excluded |= 1u << slot;
+    /* The original's period-3 exceptions (characters 101/102) map to
+     * select 34, race 1, series 62 in the current verified rival database. */
+    if (story_sel == 34 && story_series == 62 &&
+        (story_chara[slot] == 101 || story_chara[slot] == 102))
+      story_excluded |= 1u << slot;
+  }
+  int trailing;
+  int metres = hud_finish_result(r, ta_story, vs_n ? vs_n : story_n, story_excluded,
+                                 ten_level >= 0, vs_n > 0, &trailing);
   if (metres < 0) return;
-  int number = anm_find("cons_g_last_000m"), label = anm_find("cons_g_last_saigo");
+  int number = anm_find("cons_g_last_000m");
+  int label = anm_find(trailing ? "cons_g_last_tonikaku" : "cons_g_last_saigo");
   if (number < 0 || label < 0 || anm_frames(number) <= 150 || anm_frames(label) <= 30) return;
   int t[4] = {anm_sprite(0x10fc), anm_sprite(0x10fb), anm_sprite(0x10fa), anm_sprite(0x10ff)};
   int digits[4] = {anm_sprite(0x268 + metres / 100), anm_sprite(0x268 + metres / 10 % 10),
@@ -2518,9 +3010,13 @@ void hud_draw(const hud_state *h, const car_state *car, const car_input *in, flo
     glActiveTexture(GL_TEXTURE0);
   }
   if (tex_prog && consoles) {
+    race_view meter = race_view_begin(HUD_RACE_METER, h);
     draw_meters(car);
+    race_view_end(meter);
     draw_shifter(car);
+    meter = race_view_begin(HUD_RACE_METER, h);
     draw_plate(car);
+    race_view_end(meter);
     draw_ta(h, car, &proj);
     draw_plate_text();
   }
@@ -2557,6 +3053,8 @@ void hud_negate(const hud_state *h) {
   glDisable(GL_DEPTH_TEST);
   glDisable(GL_CULL_FACE);
   glEnable(GL_BLEND);
+  /* An earlier effect may have left subtractive blending selected. */
+  glBlendEquation(GL_FUNC_ADD);
   glBlendFunc(GL_ONE_MINUS_DST_COLOR, GL_ZERO);
   glBindBuffer(GL_ARRAY_BUFFER, 0);
   glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -2861,28 +3359,54 @@ void hud_layout_set(int group, float k, float dx, float dy) {
   USER_DX[group] = dx, USER_DY[group] = dy;
 }
 
-int hud_layout_hit(int gyro, float x, float y) {
+static rect group_rect_mode(int group, int mode) {
+  if (group == HUD_EDIT_SHIFT) {
+    rect up = mode == HUD_STEER_GYRO ? G_SHIFT_UP : SHIFT_UP;
+    rect down = mode == HUD_STEER_GYRO ? G_SHIFT_DOWN : SHIFT_DOWN;
+    return (rect){up.x, up.y, up.w, down.y + down.h - up.y};
+  }
+  if (group == KEY_RIGHT && shift_separate) {
+    float x = mode == HUD_STEER_GYRO ? THROTTLE.x : BRAKE.x;
+    return (rect){x, THROTTLE.y, THROTTLE.x + THROTTLE.w - x, THROTTLE.h};
+  }
+  if (group == KEY_LEFT && mode == HUD_STEER_WHEEL)
+    /* Include the slightly larger circular touch capture radius. */
+    return (rect){WHEEL_CX-128, WHEEL_CY-128, 256, 256};
+  if (group == KEY_LEFT && mode == HUD_STEER_STICK)
+    return (rect){STICK_ZONE.x, STICK_ZONE.y-14, STICK_ZONE.w, STICK_ZONE.h+14};
+  return group_rect(group, mode == HUD_STEER_GYRO);
+}
+
+int hud_layout_hit_mode(int mode, float x, float y) {
+  rect s = shift_key(group_rect_mode(HUD_EDIT_SHIFT, mode));
+  if (x >= s.x - 10 && x <= s.x + s.w + 10 && y >= s.y - 10 && y <= s.y + s.h + 10) return HUD_EDIT_SHIFT;
   for (int g = 0; g < HUD_KEY_GROUPS; ++g) {
-    rect r = key(group_rect(g, gyro), g);
+    rect r = key(group_rect_mode(g, mode), g);
     if (x >= r.x - 10 && x <= r.x + r.w + 10 && y >= r.y - 10 && y <= r.y + r.h + 10) return g;
   }
   return -1;
 }
 
-void hud_layout_clamp(int group, int gyro, float k, float *dx, float *dy) {
-  if (group < 0 || group >= HUD_KEY_GROUPS) return;
+int hud_layout_hit(int gyro, float x, float y) { return hud_layout_hit_mode(gyro ? HUD_STEER_GYRO : HUD_STEER_KEYS, x, y); }
+
+void hud_layout_clamp_mode(int group, int mode, float k, float *dx, float *dy) {
+  if (group < 0 || group > HUD_EDIT_SHIFT) return;
   k = k < HUD_KEY_K_MIN ? HUD_KEY_K_MIN : k > HUD_KEY_K_MAX ? HUD_KEY_K_MAX : k;
-  rect r = place(group_rect(group, gyro), group, k, *dx, *dy);
+  rect r = place(group_rect_mode(group, mode), group == HUD_EDIT_SHIFT ? KEY_RIGHT : group, k, *dx, *dy);
   if (r.x + r.w > 1024 + EDGE) *dx -= r.x + r.w - (1024 + EDGE);
   if (r.x < -EDGE) *dx += -EDGE - r.x;
   if (r.y + r.h > 768) *dy -= r.y + r.h - 768;
   if (r.y < 0) *dy -= r.y;
 }
 
-void hud_draw_layout(float screen_w, float screen_h, int gyro, int sel) {
+void hud_layout_clamp(int group, int gyro, float k, float *dx, float *dy) {
+  hud_layout_clamp_mode(group, gyro ? HUD_STEER_GYRO : HUD_STEER_KEYS, k, dx, dy);
+}
+
+void hud_draw_layout_mode(float screen_w, float screen_h, int mode, int sel) {
   hud_state h;
   hud_init(&h, screen_w, screen_h);
-  h.gyro = gyro;
+  hud_set_steer_mode(&h, mode);
   glUseProgram(prog);
   mat4 proj = screen_ortho(screen_w, screen_h);
   glUniformMatrix4fv(u_proj, 1, GL_FALSE, proj.m);
@@ -2898,14 +3422,18 @@ void hud_draw_layout(float screen_w, float screen_h, int gyro, int sel) {
   draw_keys(&h, 0, 1);
   glUniformMatrix4fv(u_proj, 1, GL_FALSE, proj.m);
   /* each group's box, the chosen one's orange */
-  for (int g = 0; g < HUD_KEY_GROUPS; ++g) {
-    rect r = key(group_rect(g, gyro), g);
+  for (int g = 0; g <= HUD_EDIT_SHIFT; ++g) {
+    rect r = g == HUD_EDIT_SHIFT ? shift_key(group_rect_mode(g, mode)) : key(group_rect_mode(g, mode), g);
     r = (rect){ r.x - 6, r.y - 6, r.w + 12, r.h + 12 };
     if (g == sel) color(1.0f, 0.42f, 0.05f, 0.95f);
     else color(1, 1, 1, 0.35f);
     frame_rect(r, g == sel ? 4 : 2);
   }
   glDisable(GL_BLEND);
+}
+
+void hud_draw_layout(float screen_w, float screen_h, int gyro, int sel) {
+  hud_draw_layout_mode(screen_w, screen_h, gyro ? HUD_STEER_GYRO : HUD_STEER_KEYS, sel);
 }
 
 void hud_wide(float edge, float key_k) {

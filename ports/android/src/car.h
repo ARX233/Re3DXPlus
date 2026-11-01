@@ -6,6 +6,8 @@
 #ifndef CAR_H
 #define CAR_H
 
+#include <stdint.h>
+
 typedef struct {
   float steer;    /* -1 left .. +1 right */
   float throttle; /* 0..1 */
@@ -62,6 +64,14 @@ typedef struct {
   float map_x, map_z, map_angle; /* where the minimap looks (display units) and its heading */
   int map_text;      /* the road's name on the map (EMapText, S2DInfoMap +0x14; 0 none) */
   int sign;          /* E2DSign over the car (SAreaData::GetSign): 0 none, 1..14 (hud.c) */
+  /* CSeq junction getters. select_valid includes state 0 (no selection); 1
+   * choosing, 2/3 selected. distance is raw engine mm, not clamped.
+   * line_valid only when the line getter succeeds and all nine coordinates
+   * are finite. Coordinates are engine output; coordinate space unverified. */
+  int jct_select_valid, jct_state, jct_left_area, jct_right_area;
+  float jct_distance;
+  int jct_line_valid;
+  float jct_line[3][3];
   /* clGoalLine's rows of lights across the road: bit k of lines set while row k is there (0 the
    * goal's, CSeq::GetInfoGoalLine, while the goal is ahead; 1 the next checkpoint's,
    * GetInfoSplitLine), between its two road-edge points line[k] (display units) */
@@ -78,6 +88,7 @@ typedef struct {
    * and whether it is on (getInfoStoryAdvantage / getInfoStoryCharacterEnable) */
   float story_gap[3];
   unsigned char story_on[3];
+  unsigned char story_gap_valid[3]; /* finite output written on this tick; independent of picture visibility */
   /* the 10-in-a-row (car_set_ten; CSeq::Get2DInfoTenFight): rivals beaten, the one on the road
    * (CTenSeq's number, 0 the first), s each beaten one took (ten_time[k] for rival k, the
    * one on the road's still running), s since the race's start, the gear its rolling start
@@ -109,9 +120,22 @@ typedef struct {
   int title_log_on;
   unsigned char title_log[CAR_TITLE_LOG];
   int remain_valid; /* S2DInfoRace distance was finite, nonnegative and available */
+  int ten_gap_valid; /* current rival line was observed */
+  unsigned char vs_fresh[CAR_RIVALS]; /* active on-road rival and fresh confirmed packet */
+  int vs_pcb[CAR_RIVALS];
+  double vs_observed[CAR_RIVALS]; /* packet timestamp of this physics snapshot */
 } car_race;
+/* Clears only the snapshot, for a race teardown or disconnect; no engine writes. */
+void car_clear_junction(car_race *r);
+
+/* CInfoSEMc one-shot requests accumulated until snd_update consumes them. */
+typedef struct {
+  int valb, backfire;
+  float valb_vol, backfire_vol, backfire_hz;
+} car_se;
 
 typedef struct {
+  car_se se;
   float body[16];   /* model matrix from the arcade (GL column-major, translation in 12..14) */
   float pos[3];
   float yaw, pitch, roll; /* derived from body; yaw 0 faces +z */
@@ -154,6 +178,12 @@ typedef struct {
    * the axle (radians) */
   float tyre[4][16], tyre_rot[4];
   float rival_tyre[CAR_RIVALS][4][16], rival_tyre_rot[CAR_RIVALS][4];
+#ifdef __ANDROID__
+  /* clCarEffectManager's original tire-track inputs, in its native index order:
+   * world matrices SInfoCarDisp +0x44..+0x104 and opacities
+   * SInfoCarEffect +0x40..+0x4c. Read only; never feed them back to physics. */
+  float track_matrix[4][16], track_alpha[4];
+#endif
   /* braking, as SInfoCarDisp +0x144 has it for clCarLampManager (its brake lamps' STOP):
    * CMachine::GetInfoCarDisp the brake pedal past 0.2, CRivalCar's slowing down */
   unsigned char brake, rival_brake[CAR_RIVALS];
@@ -227,6 +257,22 @@ typedef struct {
 /* The next car_start races `n` rivals (up to CAR_RIVALS; 0: a time attack alone). The race
  * is the story mode's (EGameMode 4) with the first one's select and race. */
 void car_set_rivals(const car_rival *rivals, int n);
+/* Enable the arcade's optional time-attack traffic; other modes are unaffected. */
+void car_set_ta_traffic(int on);
+
+/* In-memory-only story transition. The caller binds a nonzero token to one
+ * exact uninterrupted transition and supplies the current/next ESeries.
+ * Capture returns -1 if End was not entered, 0 if End ran without a usable
+ * snapshot, and 1 if End ran and captured. Once End runs the old car is no
+ * longer ready, even on failure. Arm permits repeated matching car_start calls
+ * for movie initialization; it does not consume the snapshot. loaded reports
+ * whether the most recent car_start actually accepted it. Finalize consumes a
+ * matching snapshot only after a successful load; cancel always clears it. */
+int car_story_carry_capture(uint64_t token, int expected_series);
+int car_story_carry_arm(uint64_t token, int target_series);
+int car_story_carry_loaded(uint64_t token);
+int car_story_carry_finalize(uint64_t token);
+void car_story_carry_cancel(void);
 /* The next car_start is a 10-in-a-row race (SConfigPlay mode 7) on the EStage (333..342; 0 off)
  * at the level (0..9, 10 the extend), with its rivals in order (their tyres for CSeq::Exec, which
  * brings each on as the one before is beaten). */
@@ -260,6 +306,12 @@ typedef struct {
 } car_link_io;
 void car_set_versus(int pcb, const car_link_car *others, int n, int ramp, float km, unsigned seed, const car_link_io *io);
 void car_link_deliver(int pcb, const unsigned char *packet, int len);
+/* Transport calls active=1 only after delivering a NEW packet validated for
+ * room, race, PCB and sequence; never on cached replay. active=0 on disconnect/teardown.
+ * No notification means unknown. Freshness expires after one monotonic second. */
+void car_link_fresh(int pcb, int active);
+int car_link_time_fresh(double now, double received);
+int car_link_observation_fresh(int pcb, double observed);
 /* the join ramp's name (C1_IN_KANDABASHI ...) */
 const char *car_link_ramp_name(int ramp);
 

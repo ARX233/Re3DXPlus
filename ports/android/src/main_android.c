@@ -25,6 +25,9 @@
 #include "timing60.h"
 #include <unistd.h>
 
+#ifdef WMMT_DEBUG_LOG
+#error "The Android 1.24 no-log build must not include the diagnostic collector"
+#endif
 #include "app.h"
 #include "gl.h"
 #include "sound.h"
@@ -101,6 +104,9 @@ static touch_active *touch_active_head;
 static int touch_strict;
 
 static void touch_cancel_all(void) {
+#ifdef WMMT_DEBUG_LOG
+  debug_log_emit("{\"event\":\"touch_cancel_all\"}");
+#endif
   while (touch_active_head) {
     touch_active *p = touch_active_head;
     touch_active_head = p->next;
@@ -151,6 +157,11 @@ static void touch_deliver(touch_ev *events, int n, int desync) {
       continue;
     }
     if (p) { p->x = e.x; p->y = e.y; }
+#ifdef WMMT_DEBUG_LOG
+    /* Phase only: raw coordinates can disclose typed names or card choices. */
+    if (e.phase == 0 || e.phase == 2 || e.phase == 3)
+      debug_log_emit("{\"event\":\"touch\",\"phase\":%d}", e.phase);
+#endif
     app_touch((void *)((intptr_t)e.id + 1), e.phase, e.x * A.touch_k - A.touch_edge, e.y * A.touch_k);
     if (p && (e.phase == 2 || e.phase == 3)) {
       *link = p->next;
@@ -338,15 +349,14 @@ static void sync_movie(void) {
 /* ---- GL ---- */
 
 #ifdef WMMT_VK
-/* Vulkan (vkgl): the pipelines it made last time from save_dir; the programs it has no SPIR-V
- * for written there too, for the next build */
+/* Vulkan (vkgl): reuse the pipeline cache from save_dir; do not collect
+ * missing-shader diagnostic files in this no-log build. */
 static int egl_init(void) {
   static const char *const ext[] = { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME };
   if (vkgl_create(ext, 2) != 0) return -1;
   char path[600];
   snprintf(path, sizeof path, "%s/vk_pipelines.bin", A.save_dir);
   vkgl_pipeline_cache_file(path);
-  setenv("VKGL_MISSING_DIR", A.save_dir, 1);
   A.vk_up = 1;
   A.load_ctx = (EGLContext)1; /* (a loading thread: vkgl's second) */
   return 0;
@@ -493,6 +503,10 @@ static void *game(void *arg) {
          * game thread even if no further surface/frame ever arrives. */
         pthread_mutex_unlock(&A.mx);
         touch_cancel_all();
+#ifdef WMMT_DEBUG_LOG
+        debug_log_emit("{\"event\":\"lifecycle_pause\"}");
+        debug_log_flush();
+#endif
         pthread_mutex_lock(&A.mx);
         app_suspend(1); /* the loading thread stops too */
 #ifdef WMMT_VK
@@ -533,7 +547,12 @@ static void *game(void *arg) {
       app_suspend(0);
       away = 0;
     }
-    if (warn) app_memory_warning();
+    if (warn) {
+#ifdef WMMT_DEBUG_LOG
+      if (debug_log_enabled()) debug_log_emit("{\"event\":\"memory_warning\"}");
+#endif
+      app_memory_warning();
+    }
     if (done) {
       A.movie = -1;
       app_movie_done();
@@ -553,6 +572,11 @@ static void *game(void *arg) {
     touch_reconcile_snapshot(&empty, &poisoned);
     if (poisoned) touch_cancel_all();
     app_frame(dt);
+#ifdef WMMT_DEBUG_LOG
+    /* Batch durability requests away from input callbacks; no synchronous I/O here. */
+    static unsigned debug_flush_frames;
+    if (++debug_flush_frames >= 120) { debug_flush_frames = 0; debug_log_flush(); }
+#endif
     sync_movie();
     /* depth and stencil need not go out to memory */
     static PFNGLDISCARDFRAMEBUFFEREXTPROC discard_fb;
@@ -570,7 +594,21 @@ static void *game(void *arg) {
 #else
     eglSwapBuffers(A.dpy, A.surface);
 #endif
-    app_frame_done((now_s() - p0) * 1000.0);
+    double present_ms = (now_s() - p0) * 1000.0;
+    app_frame_done(present_ms);
+#ifdef WMMT_DEBUG_LOG
+    {
+      static unsigned long long debug_present_seq;
+      ++debug_present_seq; /* game thread: one present for each app_frame */
+      if (debug_log_enabled() && debug_present_seq % 12 == 0) {
+        if (isfinite(present_ms) && present_ms >= 0.0 && present_ms < 1e9)
+          debug_log_emit("{\"event\":\"present\",\"render_seq\":%llu,\"swap_us\":%llu}",
+                         debug_present_seq, (unsigned long long)(present_ms * 1000.0));
+        else
+          debug_log_emit("{\"event\":\"present\",\"render_seq\":%llu,\"swap_us\":null}", debug_present_seq);
+      }
+    }
+#endif
   }
   return NULL;
 }
@@ -620,11 +658,6 @@ JNIEXPORT void JNICALL JFN(nativeStart)(JNIEnv *env, jclass cls, jobject activit
   snprintf(A.save_dir, sizeof A.save_dir, "%s", s);
   (*env)->ReleaseStringUTFChars(env, data, d);
   (*env)->ReleaseStringUTFChars(env, save, s);
-  char log[600];
-  snprintf(log, sizeof log, "%s/log.txt", A.save_dir);
-  freopen(log, "w", stderr);
-  setvbuf(stderr, NULL, _IONBF, 0);
-  fprintf(stderr, "start (android)\n");
   pthread_t t;
   pthread_attr_t at;
   pthread_attr_init(&at);
@@ -642,6 +675,9 @@ JNIEXPORT void JNICALL JFN(nativeSurface)(JNIEnv *env, jclass cls, jobject surfa
   A.window_changed = 1;
   pthread_cond_broadcast(&A.cv);
   pthread_mutex_unlock(&A.mx);
+#ifdef WMMT_DEBUG_LOG
+  if (debug_log_enabled()) debug_log_emit("{\"event\":\"surface\",\"available\":%d,\"width\":%d,\"height\":%d}", surface != NULL, (int)w, (int)h);
+#endif
   /* the old surface must be let go of before surfaceDestroyed returns */
   if (!surface) {
     for (int i = 0; i < 200; ++i) {

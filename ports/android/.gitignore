@@ -33,6 +33,8 @@ __pycache__/
 /src/sparkdb.h
 /src/steff.h
 /src/story_cutin_data.h
+/src/story_defaults_private.h
+/src/junction_table_private.h
 /src/storycity.h
 /src/storydemo.h
 /src/storyinfo.h

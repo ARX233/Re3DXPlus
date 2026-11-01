@@ -95,6 +95,7 @@ enum {
    * (0x4a, 0x4b), the level 63 part's COMPLETE (0x48); the title select's titles coming in (0x30);
    * the versus stars' star landing (0x2c) and big star (0x38) */
   S_PARTS_EQUIP, S_TUNING, S_LEVELUP, S_JACK_UP, S_JACK_DOWN, S_TUNING1, S_TUNING2, S_PARTS_COMP, S_RANK, S_WIN, S_WIN_BIGSTAR,
+  S_BACKFIRE1, S_BACKFIRE2,
   S_COUNT
 };
 /* every car type's engine and muffler loops (S_ENG0..S_MUF3 point into these) */
@@ -109,7 +110,7 @@ static const char *EFFECT_FILES[S_COUNT - S_SLIP] = { "slip", "wall", "crash1", 
                                                       "valb2", "valb3", "gyap", "door_open", "door_close",
                                                       "engine_start", "phone2", "rybal_intro", "parts_equip",
                                                       "tuning", "levelup", "jack_up", "jack_down", "tuning1",
-                                                      "tuning2", "parts_comp", "rank", "win", "win_bigstar" };
+                                                      "tuning2", "parts_comp", "rank", "win", "win_bigstar", "backfire1", "backfire2" };
 static sample SAMPLES[S_COUNT];
 
 /* Loop voices map 1:1 to the first ten samples; one-shots get their own pool. */
@@ -215,7 +216,16 @@ int snd_init(const char *data_dir) {
   return missing ? -1 : 0;
 }
 
+/* clAudio::playLoop 4: valve variant by ECarType (upstream table 0x931be80). */
+static const unsigned char VALB_BY_TYPE[48] = {
+  0,1,1,0,0,0,2,1,0,0,0,2,0,0,0,0,0,1,0,0,1,2,2,0,
+  2,0,1,0,0,1,2,0,0,2,2,0,0,2,0,0,1,2,2,0,2,2,0,0
+};
+static int valb_sample = S_VALVE;
+
 void snd_set_car(unsigned type, int power) {
+  int v = type < 48 ? VALB_BY_TYPE[type] : 0;
+  valb_sample = v == 0 ? S_VALVE : v == 1 ? S_VALB2 : S_VALB3;
   const unsigned char *by_type = power >= 8 ? SOUNDDB_BY_TYPE : SOUNDDB_BY_TYPE_STOCK;
   int k = type < SOUNDDB_NTYPES ? by_type[type] : 0;
   /* the audio thread reads each voice's sample pointer once per mix */
@@ -268,9 +278,10 @@ static struct {
   float rpm;
   float accel, accel_target, accel_step; /* clAudioControl EngAccelOn/Off/ShiftUp/Down, 0..5000 */
   int throttle_on;
-  float valve_cooldown, shot_cooldown;
+  float shot_cooldown, valb_left;
   float tick;
-} E = { 1000, 1000, 1000, 1000, 0, 0, 0, 0 };
+  unsigned backfire_k;
+} E = { .rpm = 1000, .accel = 1000, .accel_target = 1000, .accel_step = 1000 };
 
 void snd_update(car_state *car, const car_input *in, float dt) {
   /* throttle state and gear changes drive the muffler level like the arcade */
@@ -278,12 +289,10 @@ void snd_update(car_state *car, const car_input *in, float dt) {
   if (on && !E.throttle_on) { E.accel_target = 5000; E.accel_step = 1000; }
   if (!on && E.throttle_on) {
     E.accel_target = 1000; E.accel_step = 1000;
-    if (E.rpm > 4500 && E.valve_cooldown <= 0) { play_shot(S_VALVE, 0.55f, 1.0f); E.valve_cooldown = 0.6f; }
   }
   E.throttle_on = on;
   if (car->shift_event > 0) {
     E.accel = fmaxf(0, E.accel_target - 5000); E.accel_step = 400;
-    if (on && E.rpm > 5000 && E.valve_cooldown <= 0) { play_shot(S_VALVE, 0.45f, 1.05f); E.valve_cooldown = 0.6f; }
   } else if (car->shift_event < 0) {
     E.accel = fminf(5000, E.accel_target + 5000); E.accel_step = 8;
   }
@@ -293,8 +302,18 @@ void snd_update(car_state *car, const car_input *in, float dt) {
     if (E.accel > E.accel_target) E.accel = fmaxf(E.accel_target, E.accel - E.accel_step);
     else if (E.accel < E.accel_target) E.accel = fminf(E.accel_target, E.accel + E.accel_step);
   }
-  E.valve_cooldown -= dt;
   E.shot_cooldown -= dt;
+  E.valb_left -= dt;
+  if (car->se.valb && E.valb_left <= 0 && isfinite(car->se.valb_vol) && car->se.valb_vol >= 0) {
+    play_shot(valb_sample, 0.73f * 0.73f * car->se.valb_vol, 1.0f);
+    E.valb_left = SAMPLES[valb_sample].rate > 0 ? (float)SAMPLES[valb_sample].n / SAMPLES[valb_sample].rate : 0.5f;
+  }
+  if (car->se.backfire && isfinite(car->se.backfire_vol) && car->se.backfire_vol >= 0 && isfinite(car->se.backfire_hz)) {
+    int id = (E.backfire_k++ & 1u) ? S_BACKFIRE1 : S_BACKFIRE2;
+    float hz = car->se.backfire_hz;
+    play_shot(id, 0.73f * car->se.backfire_vol, hz > 0 ? hz / 22050.0f : 1.0f);
+  }
+  car->se.valb = car->se.backfire = 0;
 
   /* Prevent NaN/Inf or absurd inputs from poisoning the smoothed state. */
   float input_rpm = car->rpm;

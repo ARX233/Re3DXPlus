@@ -48,6 +48,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
   static native void nativeMemoryWarning();
   static native void nativeBgmFailure(MainActivity owner, int group);
 
+  private static MainActivity currentActivity;
+  private boolean installReady;
+  private String saveDir;
   private FrameLayout root;
   private SurfaceView game;
   private VideoView movie;
@@ -64,6 +67,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
   private ExecutorService bgmExecutor;
   private int surfaceWidth, surfaceHeight;
   private static final Object INSTALL_LOCK = new Object();
+  /* Held until process exit: another cooperating process must not install while native runs. */
+  private static DataCoordinator.ProcessLock processInstallLock;
+  private static String nativeDataDir;
+  private static File nativeCardResources;
+
+  private void lockInstallProcess() throws IOException {
+    if (processInstallLock != null && processInstallLock.valid()) return;
+    processInstallLock = DataCoordinator.acquire(new File(getFilesDir(), "game-data-install.lock").toPath());
+  }
   private static final String ASSET = "re3dxplus-data.zip";
   private static final String MARKER = ".re3dxplus-install-v1";
   private static final String CUTIN_ASSET = "story-cutin.bin";
@@ -71,6 +83,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
 
   @Override protected void onCreate(Bundle b) {
     super.onCreate(b);
+    currentActivity = this;
     getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON | WindowManager.LayoutParams.FLAG_FULLSCREEN);
     if (android.os.Build.VERSION.SDK_INT >= 28)
       getWindow().getAttributes().layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
@@ -92,40 +105,55 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
     File ext = getExternalFilesDir(null);
     if (ext == null) { installError("External app storage is unavailable."); return; }
     File save = new File(ext, "wmmt");
-    if (!save.isDirectory() && !save.mkdirs()) { installError("Cannot access save directory."); return; }
     new Thread(() -> {
       try {
         File data;
         File sidecar = null;
         synchronized (INSTALL_LOCK) {
-          data = prepareData(ext, save);
-          try { prepareCutin(ext); }
-          catch (Exception optional) { android.util.Log.w("WMMT", "Optional cut-in asset unavailable", optional); }
-          try { prepareCardPages(ext); }
-          catch (Exception optional) { android.util.Log.w("WMMT", "Optional card pages unavailable", optional); }
-          try { prepareBackfire(ext); }
-          catch (Exception optional) { android.util.Log.w("WMMT", "Optional backfire assets unavailable", optional); }
-          try { sidecar = CardResources.prepare(getAssets(), ext); }
-          catch (Exception optional) { android.util.Log.w("WMMT", "Optional card resources unavailable", optional); }
+          lockInstallProcess();
+          if (!save.isDirectory() && !save.mkdirs()) throw new IOException("Cannot access save directory");
+          data = nativeDataDir == null ? prepareData(ext, save) : new File(nativeDataDir);
+          if (nativeDataDir == null) {
+            try { prepareCutin(ext); }
+            catch (Exception optional) { android.util.Log.w("WMMT", "Optional cut-in asset unavailable", optional); }
+            try { prepareCardPages(ext); }
+            catch (Exception optional) { android.util.Log.w("WMMT", "Optional card pages unavailable", optional); }
+            try { prepareBackfire(ext); }
+            catch (Exception optional) { android.util.Log.w("WMMT", "Optional backfire assets unavailable", optional); }
+            try { sidecar = CardResources.prepare(getAssets(), ext); }
+            catch (Exception optional) { android.util.Log.w("WMMT", "Optional card resources unavailable", optional); }
+          } else sidecar = nativeCardResources;
         }
         final File ready = data;
         final File cardResources = sidecar;
         runOnUiThread(() -> {
-          if (destroyed || isFinishing()) return;
+          if (destroyed || currentActivity != this || isFinishing()) return;
           dataDir = ready.getAbsolutePath();
           this.cardResources = cardResources;
-          nativeStart(this, dataDir, save.getAbsolutePath(), cardResources == null ? null : cardResources.getAbsolutePath());
-          started = true;
-          root.removeView(progress);
-          Surface surface = game.getHolder().getSurface();
-          if (surfaceWidth > 0 && surfaceHeight > 0 && surface != null && surface.isValid())
-            nativeSurface(surface, surfaceWidth, surfaceHeight);
-          nativePause(!resumed);
+          saveDir = save.getAbsolutePath();
+          installReady = true;
+          startGame();
         });
       } catch (Exception ex) {
         runOnUiThread(() -> { if (!destroyed && !isFinishing()) installError("Game data installation failed: " + ex.getMessage()); });
       }
     }, "game-data-installer").start();
+  }
+
+  private void startGame() {
+    if (!installReady || started || destroyed || currentActivity != this || isFinishing()) return;
+    synchronized (INSTALL_LOCK) {
+      if (nativeDataDir == null) { nativeDataDir = dataDir; nativeCardResources = cardResources; }
+      dataDir = nativeDataDir; // nativeStart can retain the first process-wide data path.
+      cardResources = nativeCardResources;
+      nativeStart(this, dataDir, saveDir, cardResources == null ? null : cardResources.getAbsolutePath());
+      started = true;
+    }
+    root.removeView(progress);
+    Surface surface = game.getHolder().getSurface();
+    if (surfaceWidth > 0 && surfaceHeight > 0 && surface != null && surface.isValid())
+      nativeSurface(surface, surfaceWidth, surfaceHeight);
+    nativePause(!resumed);
   }
 
   private void installError(String message) {
@@ -321,87 +349,31 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
     }
   }
 
-  /* A missing asset explicitly opts out and preserves the adb-pushed legacy layout. */
+  /* The private lock remains held for the lifetime of this process, including native use.
+   * Other writers such as root/ADB must not mutate data concurrently. */
   private File prepareData(File ext, File legacy) throws Exception {
-    boolean present = false;
     String[] assets = getAssets().list("");
     if (assets == null) throw new IOException("Cannot list APK assets");
+    boolean present = false;
     for (String name : assets) if (ASSET.equals(name)) present = true;
-    if (!present) return legacy;
+    File stateRoot = getNoBackupFilesDir();
+    if (stateRoot == null) throw new IOException("Private update storage is unavailable");
+    /* No released version uses this earlier draft path. Never silently discard it. */
+    if (new File(getFilesDir(), "game-data-state").exists())
+      throw new IOException("Unrecognized existing update state; preserve it and contact support");
+    if (!present) {
+      if (new File(stateRoot, "game-data-state/pending").exists())
+        throw new IOException("Interrupted data update requires its packaged ZIP to repair");
+      return legacy;
+    }
     installProgress("Checking packaged game data…");
-    MessageDigest digest = MessageDigest.getInstance("SHA-256");
-    byte[] buffer = new byte[65536];
-    try (InputStream in = getAssets().open(ASSET)) {
-      int n; while ((n = in.read(buffer)) != -1) digest.update(buffer, 0, n);
-    }
-    StringBuilder hash = new StringBuilder();
-    for (byte b : digest.digest()) hash.append(String.format(java.util.Locale.ROOT, "%02x", b & 255));
-    String version = "re3dxplus-data-v1:" + hash;
-    File base = new File(ext, "re3dxplus-data");
-    if (!base.isDirectory() && !base.mkdirs()) throw new IOException("Cannot create data directory");
-    String basePath = base.getCanonicalPath() + File.separator;
-    File[] candidates = base.listFiles();
-    if (candidates == null) throw new IOException("Cannot list installations");
-    for (File candidate : candidates) {
-      if (!candidate.getName().startsWith(hash + "-") || !candidate.isDirectory()
-          || !candidate.getCanonicalPath().startsWith(basePath)) continue;
-      File marker = new File(candidate, MARKER);
-      if (!marker.getCanonicalPath().equals(new File(candidate.getCanonicalFile(), MARKER).getPath())) continue;
-      if (marker.isFile() && marker.length() == version.length()) {
-        byte[] bytes = new byte[version.length()];
-        try (FileInputStream in = new FileInputStream(marker)) {
-          int used = 0, n; while (used < bytes.length && (n = in.read(bytes, used, bytes.length - used)) > 0) used += n;
-          if (used == bytes.length && version.equals(new String(bytes, "UTF-8"))) return candidate;
-        }
-      }
-    }
-    File dest = new File(base, hash + "-" + UUID.randomUUID());
-    if (!dest.getCanonicalPath().startsWith(basePath) || !dest.mkdir()) throw new IOException("Cannot create unique installation");
-    String rootPath = dest.getCanonicalPath() + File.separator;
-    HashSet<String> entries = new HashSet<>();
-    long total = 0; int files = 0, count = 0;
-    try (ZipInputStream zip = new ZipInputStream(getAssets().open(ASSET))) {
-      ZipEntry entry;
-      while ((entry = zip.getNextEntry()) != null) {
-        String name = entry.getName();
-        if (++count > 200000 || name.isEmpty() || name.startsWith("/") || name.indexOf('\\') >= 0 || name.indexOf(':') >= 0)
-          throw new IOException("Invalid archive entry");
-        String[] parts = name.split("/", -1);
-        for (int i = 0; i < parts.length; i++) {
-          if ((parts[i].isEmpty() && i != parts.length - 1) || parts[i].equals(".") || parts[i].equals("..") || parts[i].equals(MARKER))
-            throw new IOException("Unsafe archive path: " + name);
-        }
-        File output = new File(dest, name);
-        String path = output.getCanonicalPath();
-        if (!path.startsWith(rootPath) || !entries.add(path)) throw new IOException("Duplicate or unsafe archive path: " + name);
-        if (entry.isDirectory()) {
-          if (!output.isDirectory() && !output.mkdirs()) throw new IOException("Cannot create directory: " + name);
-        } else {
-          File parent = output.getParentFile();
-          if (!parent.isDirectory() && !parent.mkdirs()) throw new IOException("Cannot create parent: " + name);
-          if (!output.createNewFile()) throw new IOException("File already exists: " + name);
-          try (FileOutputStream out = new FileOutputStream(output)) {
-            int n; while ((n = zip.read(buffer)) != -1) {
-              total += n;
-              if (total > 50L * 1024 * 1024 * 1024) throw new IOException("Archive exceeds unpacking limit");
-              out.write(buffer, 0, n);
-            }
-            out.getFD().sync();
-          }
-          files++;
-          if ((files & 31) == 0) installProgress("Installing game data: " + files + " files, " + (total / 1048576) + " MiB");
-        }
-        zip.closeEntry();
-      }
-    }
-    if (files == 0) throw new IOException("Archive contains no files");
-    File marker = new File(dest, MARKER);
-    if (!marker.createNewFile()) throw new IOException("Cannot create completion marker");
-    try (FileOutputStream out = new FileOutputStream(marker)) {
-      out.write(version.getBytes("UTF-8"));
-      out.getFD().sync();
-    }
-    return dest;
+    DataManifest.Limits limits = new DataManifest.Limits(200000, 50L * 1024 * 1024 * 1024,
+        Integer.MAX_VALUE, 64 * 1024 * 1024);
+    File canonicalExt = ext.getCanonicalFile();
+    File privateDir = stateRoot.getCanonicalFile();
+    DataCoordinator coordinator = new DataCoordinator(new File(canonicalExt, "re3dxplus-data").toPath(),
+        new File(privateDir, "game-data-state").toPath(), limits);
+    return coordinator.prepare(() -> getAssets().open(ASSET), null).toFile();
   }
 
   private void hideBars() {
@@ -416,7 +388,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
   }
 
   private void touch(MotionEvent e) {
-    if (!started) return;
+    if (!started || currentActivity != this) return;
     int a = e.getActionMasked();
     if (a == MotionEvent.ACTION_MOVE) {
       for (int i = 0; i < e.getPointerCount(); ++i) nativeTouch(e.getPointerId(i), 1, e.getX(i), e.getY(i));
@@ -445,17 +417,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
       try { surface.setFrameRate(60.0f, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE); }
       catch (IllegalStateException | IllegalArgumentException ignored) { }
     }
-    if (started) nativeSurface(surface, w, ht);
+    if (started && currentActivity == this) nativeSurface(surface, w, ht);
   }
   @Override public void surfaceDestroyed(SurfaceHolder h) {
     surfaceWidth = surfaceHeight = 0;
-    if (started) nativeSurface(null, 0, 0);
+    if (started && currentActivity == this) nativeSurface(null, 0, 0);
   }
 
   @Override protected void onPause() {
     super.onPause();
     resumed = false;
-    if (started) nativePause(true);
+    if (started && currentActivity == this) nativePause(true);
     if (sensors != null) sensors.unregisterListener(this);
     if (bgm != null && !bgmPreparing) bgm.pause();
     if (movie != null) movie.pause();
@@ -465,7 +437,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
     super.onResume();
     hideBars();
     resumed = true;
-    if (started) nativePause(false);
+    if (started && currentActivity == this) nativePause(false);
     if (gravity != null && sensors != null) sensors.registerListener(this, gravity, SensorManager.SENSOR_DELAY_GAME);
     if (bgm != null && !bgmPreparing) bgm.start();
     if (movie != null) movie.start();
@@ -473,6 +445,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
 
   @Override protected void onDestroy() {
     destroyed = true;
+    if (currentActivity == this) currentActivity = null;
     ++bgmGeneration;
     if (bgmExecutor != null) { bgmExecutor.shutdownNow(); bgmExecutor = null; }
     if (bgm != null) { bgm.release(); bgm = null; }
@@ -483,14 +456,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
 
   @Override public void onTrimMemory(int level) {
     super.onTrimMemory(level);
-    if (started && level >= TRIM_MEMORY_RUNNING_LOW) nativeMemoryWarning();
+    if (started && currentActivity == this && level >= TRIM_MEMORY_RUNNING_LOW) nativeMemoryWarning();
   }
 
   /* the phone turned like a wheel (main.m's tilt): gravity's angle in the screen's plane from
    * its down, clockwise positive; nothing when it lies flat. In landscape the screen's right is
    * the sensor's -y (rotation 90) or +y (270) and its down the sensor's +x or -x. */
   @Override public void onSensorChanged(SensorEvent e) {
-    if (!started || !nativeWantsTilt()) return;
+    if (!started || currentActivity != this || !nativeWantsTilt()) return;
     float gx = e.values[0], gy = e.values[1];
     int rot = getWindowManager().getDefaultDisplay().getRotation();
     float right = rot == Surface.ROTATION_270 ? gy : -gy, down = rot == Surface.ROTATION_270 ? -gx : gx;

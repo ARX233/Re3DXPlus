@@ -13,6 +13,8 @@ class Activity { protected void onPause(){} protected void onResume(){} protecte
 class Sensors { void unregisterListener(Object o){} void registerListener(Object o,Object g,int rate){} }
 class SensorManager { static final int SENSOR_DELAY_GAME=1; }
 class Movie { void pause(){} void start(){} void stopPlayback(){} }
+class Handler { Runnable removed; void removeCallbacks(Runnable r){removed=r;} }
+class AlertDialog { boolean dismissed; void dismiss(){dismissed=true;} }
 class CardResources { static File music(File f,String n) { return f; } }
 class MediaPlayer {
  interface Error { boolean call(MediaPlayer p,int w,int e); } interface Prepared { void call(MediaPlayer p); }
@@ -23,12 +25,13 @@ class MediaPlayer {
 class FakeExecutor extends AbstractExecutorService { ArrayList<Runnable> q=new ArrayList<>(); boolean closed; public void execute(Runnable r){q.add(r);} public void shutdown(){closed=true;} public java.util.List<Runnable> shutdownNow(){closed=true;return q;} public boolean isShutdown(){return closed;} public boolean isTerminated(){return closed;} public boolean awaitTermination(long n,TimeUnit u){return true;} void run(){q.remove(0).run();} }
 public class AsyncStateTest extends Activity {
  volatile boolean started=true,destroyed=false; boolean resumed=true,bgmPreparing; volatile long bgmGeneration; ExecutorService bgmExecutor; MediaPlayer bgm; float bgmVolume=1; File cardResources,dataDir; int failures; ArrayList<Runnable> ui=new ArrayList<>();
+ static AsyncStateTest currentActivity; final Handler logHandler=new Handler(); final Runnable logHealthCheck=()->{}; AlertDialog consentDialog;
  Sensors sensors; Object gravity; Movie movie; void nativePause(boolean p){} void hideBars(){}
  boolean isFinishing(){return false;} void nativeBgmFailure(AsyncStateTest a,int g){failures++;} void runOnUiThread(Runnable r){ui.add(r);} void drain(){while(!ui.isEmpty())ui.remove(0).run();} void worker(){((FakeExecutor)bgmExecutor).run();}
 '''+lifecycle+methods+'''
  static void check(boolean b){if(!b)throw new AssertionError();}
  public static void main(String[] x)throws Exception {
-  AsyncStateTest a=new AsyncStateTest(); a.cardResources=File.createTempFile("music",".m4a",new File(x[0])); a.dataDir=new File(x[0],"fixture"); a.dataDir.mkdirs();
+  AsyncStateTest a=new AsyncStateTest(); currentActivity=a; a.cardResources=File.createTempFile("music",".m4a",new File(x[0])); a.dataDir=new File(x[0],"fixture"); a.dataDir.mkdirs();
   a.playBgm("wm2_01");a.drain(); a.playBgm("wmr_01");a.drain(); a.worker();check(a.ui.isEmpty());a.worker();a.drain();MediaPlayer old=a.bgm;check(a.bgmPreparing);
   a.onPause();a.onResume();check(a.bgmPreparing&&!old.playing);a.onPause();a.setBgmVolume(.25f);a.drain();old.firePrepared();check(!old.playing&&old.volume==.25f);a.onResume();check(old.playing);
   a.playBgm("wm2_01");a.drain();check(old.released);a.worker();a.drain();MediaPlayer current=a.bgm;old.error.call(old,1,1);old.prepared.call(old);check(a.bgm==current&&a.failures==0);
@@ -38,7 +41,15 @@ public class AsyncStateTest extends Activity {
   File dir=new File(a.dataDir,"sound/bgm");dir.mkdirs();new File(dir,"legacy.m4a").createNewFile();
   a.playBgm("wm2_01");a.drain();a.worker();a.playBgm("legacy");a.drain();MediaPlayer legacy=a.bgm;check(legacy!=null&&legacy.playing&&!a.bgmPreparing&&a.failures==1);
   a.playBgm("wm2_01");a.drain();a.worker();a.drain();MediaPlayer dead=a.bgm;a.onDestroy();dead.error.call(dead,1,1);dead.prepared.call(dead);check(dead.released&&a.failures==1);
-  System.out.println("fake executor/player state tests passed");
+  // A replacement Activity becomes current before the old instance is destroyed.
+   AsyncStateTest previous=new AsyncStateTest(); currentActivity=previous; previous.cardResources=a.cardResources; previous.dataDir=a.dataDir; previous.consentDialog=new AlertDialog();
+   previous.playBgm("wm2_01");previous.drain();previous.worker();previous.drain();MediaPlayer stale=previous.bgm;check(previous.bgmPreparing);
+   AsyncStateTest replacement=new AsyncStateTest();currentActivity=replacement;replacement.cardResources=a.cardResources;replacement.dataDir=a.dataDir;
+   replacement.playBgm("wmr_01");replacement.drain();replacement.worker();replacement.drain();MediaPlayer fresh=replacement.bgm;check(replacement.bgmPreparing);
+   previous.onDestroy();check(currentActivity==replacement&&previous.logHandler.removed==previous.logHealthCheck&&previous.consentDialog.dismissed&&stale.released);
+   stale.error.call(stale,1,1);stale.prepared.call(stale);check(previous.bgm==null&&previous.failures==0&&replacement.bgm==fresh&&replacement.bgmPreparing&&replacement.failures==0&&!fresh.playing);
+   fresh.firePrepared();check(fresh.playing&&!fresh.released);replacement.onDestroy();check(currentActivity==null&&fresh.released);
+   System.out.println("fake executor/player state tests passed");
  }
 }
 '''

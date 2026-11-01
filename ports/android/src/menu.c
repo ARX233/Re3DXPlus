@@ -24,6 +24,11 @@
 #include "sound.h"
 #include "title.h"
 
+/* Derived locally from the user's verified original; never distributed in the repository. */
+#if defined(__ANDROID__) || defined(WMMT_STORY_DEFAULTS_TEST)
+#include "story_defaults_private.h"
+#endif
+
 /* Frame layout of the arcade's animations (found by stepping through them):
  * - menu_g_topbar_bar / menu_g_bottombar_bar: 0..159 idle, 160..170 slide out, 189..199 slide in.
  * - menu_layout_ta_carsel (clSeqTaModeSelectThread's clMenuSpinBoxStd, its defaults): 100
@@ -1106,7 +1111,11 @@ const char *menu_bgm(const menu_state *m, int racing) {
   if (racing || (m->screen == MENU_PRE && m->pre_quiet)) return card_bgm_file(m, m->song);
   if (m->screen < MENU_START) return NULL; /* the attract loop: its movies have their own sound */
   /* mseqTimeAttack stops the music once the BGM is chosen (before seqTaCourseDecide) */
-  if ((m->screen == MENU_BGM && m->deciding) || m->screen == MENU_PRE) return NULL;
+  if ((m->screen == MENU_BGM && m->deciding) || m->screen == MENU_PRE
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+      || (m->screen == MENU_SETTING && m->pre_tune_setting)
+#endif
+      ) return NULL;
   /* the result's music plays on through the screens after a race (mseqStory: no stream change
    * from result2's 0x6d till its sequence ends; the story's tuning, the dress-up parts won),
    * the select music back on the mode select; the car setting's on the dress-up menu it opens */
@@ -1165,7 +1174,11 @@ static int day_select_step(menu_state *m, int tap, int key) {
     return 0;
   }
   /* (a versus' BGM is the host's: the others have no line) */
+#if defined(__ANDROID__) || defined(WMMT_BGM_TEST)
+  int bgm = !m->vs.day || m->vs.me == m->vs.host;
+#else
   int bgm = !m->story_day_select && (!m->vs.day || m->vs.me == m->vs.host);
+#endif
   int d = m->zones > 1 || !bgm ? 0 : key;
   /* the BGM line itself (with the arrow keys either side of it) steps on, like the button */
   if (bgm && tap && m->tap_x >= 170.0f && m->tap_x < 560.0f && m->tap_y >= 326.0f && m->tap_y < 392.0f) d = 1;
@@ -1177,8 +1190,15 @@ static int day_select_step(menu_state *m, int tap, int key) {
     return 0;
   }
   if (tap && on_card(m, 0)) {
-    if (m->story_day_select) { snd_menu(SND_SELECT); m->story_zone = m->zone; }
-    else day_decide(m);
+    if (m->story_day_select) {
+      snd_menu(SND_SELECT); m->story_zone = m->zone;
+#if defined(__ANDROID__) || defined(WMMT_BGM_TEST)
+      /* Per-race selection only: do not replace the time-attack BGM preference. */
+      int lines = card_bgm_lines(m), line = m->sel;
+      if (line < 0 || line >= lines) line = 0;
+      m->song = line == 0 ? 1 + rand() % (lines - 2) : line == lines - 1 ? -1 : line;
+#endif
+    } else day_decide(m);
     return 1;
   }
   return 0;
@@ -1331,7 +1351,10 @@ static void draw_day_select(const menu_state *m, int clock, float fade, int bars
     draw_topbar(bars, fade, &title);
   }
   anm_draw(ID.bottom, bars, fade);
-  if (m->story_day_select || (m->vs.day && m->vs.me != m->vs.host)) return; /* a versus' song is the host's */
+#if !defined(__ANDROID__) && !defined(WMMT_BGM_TEST)
+  if (m->story_day_select) return;
+#endif
+  if (m->vs.day && m->vs.me != m->vs.host) return; /* a versus' song is the host's */
   int set = card_bgm_set(m), line = m->sel;
   if (line < 0 || line >= CARD_BGM_SETS[set].lines) line = 0;
   anm_swap name[2] = { { anm_sprite(T_BGM_FONT), anm_sprite(BGM_TEXT + 30 * set + line) },
@@ -1374,6 +1397,14 @@ static const short GAGE_X[CAR_TUNE_MAX] = { 171, 190, 209, 228, 247, 266, 285, 3
 #define SET_CAR_Y0 150.0f
 #define SET_CAR_Y1 250.0f
 
+static int pre_tune_context(const menu_state *m) {
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+  return m->pre_tune_setting && m->screen == MENU_SETTING;
+#else
+  (void)m; return 0;
+#endif
+}
+
 /* the car's tune: the FULL TUNE's setting, else the story's steps (the card's tune, which
  * the arcade's every mode races on; a stock car's setting and card showed 280 hp for a car
  * the story had brought to 400, Allan 10-25) */
@@ -1382,6 +1413,26 @@ void menu_tune(const menu_state *m, int *power, int *handling) {
   *power = full ? m->tune_power[m->maker][m->car] : m->st_power[m->maker][m->car];
   *handling = full ? CAR_TUNE_TOTAL - *power : m->st_handling[m->maker][m->car];
 }
+
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+/* Capture the effective tune, never the saved arrays. Single-player keeps its
+ * full-tune eligibility; VS also permits a partial card's existing point total. */
+static int pre_tune_enter(menu_state *m, int origin, int bgm_sel, int story_day) {
+  int p, h;
+  pre_race_tune_clear(&m->pre_tune);
+  if (m->maker < 0 || m->maker >= CARDB_ALL || m->car < 0 || m->car >= CARDB_NCARS[m->maker]) return 0;
+  if (m->game == MENU_GAME_STORY) menu_story_tune(m, &p, &h);
+  else menu_tune(m, &p, &h);
+  if (!pre_race_tune_begin(&m->pre_tune, m->game, m->maker, m->car, p, h)) return 0;
+  m->pre_tune_origin = origin;
+  m->pre_tune_bgm_sel = bgm_sel;
+  m->pre_tune_story_day = story_day;
+  m->pre_tune_setting = 1;
+  go(m, MENU_SETTING);
+  return 1;
+}
+
+#endif
 
 /* the chips' left edges: STOCK, FULL TUNE, AT, MT */
 static void setting_chips(float x[4]) {
@@ -1435,6 +1486,9 @@ static void draw_setting(const menu_state *m, int clock, void (*draw3d)(void *),
   int power, handling;
   menu_tune(m, &power, &handling);
   int full = m->tune_full[m->maker][m->car];
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+  if (m->pre_tune_setting) { power = m->pre_tune.power; handling = m->pre_tune.base_power + m->pre_tune.base_handling - power; }
+#endif
   draw_back(ID.bg_carsel, clock % 240, 1);
   draw_bg_logo(c, clock % 240, 1);
   anm_draw(ID.line, clock % anm_frames(ID.line), 1);
@@ -1448,7 +1502,7 @@ static void draw_setting(const menu_state *m, int clock, void (*draw3d)(void *),
   for (int k = 0; k < 4; ++k)
     if (!(k < 2 && m->tune_locked && !lit[k]))
       anm_draw_sprite(anm_sprite(SET_TEXT + k), x[k], SET_ROW_Y, lit[k] ? 1.0f : 0.3f);
-  if (full) anm_draw(ID.set_handle, clock % anm_frames(ID.set_handle), 1);
+  if (full || pre_tune_context(m)) anm_draw(ID.set_handle, clock % anm_frames(ID.set_handle), 1);
   /* the gauges */
   anm_draw_sprite(anm_sprite(T_SET_BAND), -192.0f, 246.0f, 0.5f);
   anm_draw_sprite(anm_sprite(T_SET_POWER), 7.0f, 256.0f, 1);
@@ -1556,11 +1610,6 @@ static void option_set(menu_state *m, int *v, int want) {
 #define OPT_HQ_Y 288.0f /* the first row's middle */
 #define OPT_HQ_DY 23.0f
 #define OPT_HQ_HALF 11.0f
-/* Sixth row lies below both existing columns (last centre 380); disjoint tap bands. */
-#define OPT_ENHANCE_Y (OPT_HQ_Y + 5.0f * OPT_HQ_DY)
-#define OPT_ENHANCE_X 220.0f
-#define OPT_ENHANCE_GAP 55.0f
-#define OPT_ENHANCE_PX 2.0f
 static const struct { int label, first; float x, chip_x; } OPT_HQ_ROW[10] = {
   { O_REFLECTION, O_ON, 16, 190 }, { O_SHARP, O_ON, 16, 190 }, { O_AO, O_ON, 16, 190 }, { O_BM, O_ON, 16, 190 },
   { O_HD, O_ON, 16, 190 }, { O_BLOOM, O_ON, 332, 500 }, { O_SSAO, O_ON, 332, 500 }, { O_WET, O_ON, 332, 500 },
@@ -1580,16 +1629,6 @@ static void option_hq_chips(int row, float x[2]) {
 }
 
 static void option_hq_step(menu_state *m) {
-  if (m->tap_y >= OPT_ENHANCE_Y - OPT_HQ_HALF && m->tap_y < OPT_ENHANCE_Y + OPT_HQ_HALF) {
-    for (int k = 0; k < 2; ++k) {
-      float x = OPT_ENHANCE_X + OPT_ENHANCE_GAP * k;
-      if (m->tap_x >= x && m->tap_x < x + 45.0f && m->enhance_on != !k) {
-        snd_menu(SND_CURSOR);
-        m->enhance_on = !k;
-        m->enhance_changed = 1;
-      }
-    }
-  }
   for (int row = 0; row < 10; ++row) {
     float y = OPT_HQ_Y + OPT_HQ_DY * (float)(row % 5), x[2];
     if (m->tap_y < y - OPT_HQ_HALF || m->tap_y >= y + OPT_HQ_HALF) continue;
@@ -1613,16 +1652,6 @@ static void draw_option_hq(const menu_state *m) {
     for (int k = 0; k < 2; ++k)
       anm_draw_sprite(anm_sprite(OPT_TEXT + OPT_HQ_ROW[row].first + k), x[k], y - 15.0f, on == !k ? 1.0f : 0.3f);
   }
-}
-
-static void draw_option_enhance(const menu_state *m, float screen_w, float screen_h) {
-  /* menu_touch and the existing option overlay share the 1024x768 logical scene. */
-  const float k = 1.6f, top = OPT_ENHANCE_Y * k - 3.5f * OPT_ENHANCE_PX;
-  hud_ui_begin(screen_w, screen_h);
-  hud_ui_text("ENHANCED LIGHTING", 16.0f * k, top, OPT_ENHANCE_PX, 1, 1, 1, 1);
-  hud_ui_text("ON", OPT_ENHANCE_X * k, top, OPT_ENHANCE_PX, 1, 1, 1, m->enhance_on ? 1.0f : 0.3f);
-  hud_ui_text("OFF", (OPT_ENHANCE_X + OPT_ENHANCE_GAP) * k, top, OPT_ENHANCE_PX, 1, 1, 1, m->enhance_on ? 0.3f : 1.0f);
-  hud_ui_end();
 }
 
 /* An iPad's RESOLUTION row (res_row; Allan 10-27, for the Retina iPads after the iPad 3): its
@@ -1664,6 +1693,228 @@ static void draw_option_res(const menu_state *m, float screen_w, float screen_h)
  * puts every group back, DONE (or the back key) back to OPTION. Its key on the OPTION screen
  * on the PEDALS row's right. Its words the HUD's (no pre-rendered ones), in the 1024 x 768
  * layout. ---- */
+#if defined(__ANDROID__) || defined(WMMT_HUD_CUSTOM_TEST)
+/* Android has a separate, versioned extension; the three legacy key groups stay untouched. */
+enum { LAY_PAGE, LAY_PREV, LAY_NEXT, LAY_SMALLER, LAY_BIGGER, LAY_DEAD_MINUS, LAY_DEAD_PLUS,
+       LAY_RESET, LAY_RESET_ALL, LAY_DONE, LAY_CENTER, LAY_BUTTONS };
+static const float LAY_PANEL[4] = { 272, 198, 480, 380 };
+static const float LAY_BUTTON[LAY_BUTTONS][4] = {
+  { 296, 238, 432, 38 }, { 296, 283, 80, 38 }, { 648, 283, 80, 38 },
+  { 296, 328, 80, 38 }, { 648, 328, 80, 38 },
+  { 296, 373, 80, 38 }, { 648, 373, 80, 38 },
+  { 296, 418, 204, 38 }, { 524, 418, 204, 38 }, { 296, 506, 432, 45 },
+  { 296, 554, 432, 22 }
+};
+static const float OPT_LAYOUT_KEY[4] = { 446, 110, 176, 26 };
+#define LAY_K_STEP 10
+static int layout_button(float x, float y) {
+  for (int b = 0; b < LAY_BUTTONS; ++b) {
+    const float *r = LAY_BUTTON[b];
+    if (x >= r[0] && x < r[0]+r[2] && y >= r[1] && y < r[1]+r[3]) return b;
+  }
+  return -1;
+}
+static HudCustomTransform *layout_transform(menu_state *m, int g) {
+  if (!m->lay_page) return g == HUD_EDIT_SHIFT ? &m->custom_layout.shift : NULL;
+  switch (g) {
+    case HUD_RACE_MAP: return &m->custom_layout.map;
+    case HUD_RACE_RANK: return &m->custom_layout.rank;
+    case HUD_RACE_TIME: return &m->custom_layout.timer;
+    case HUD_RACE_METER: return &m->custom_layout.meter;
+    default: return NULL;
+  }
+}
+static int layout_count(const menu_state *m) { return m->lay_page ? HUD_RACE_GROUPS : HUD_KEY_GROUPS + 1; }
+static int layout_valid(const menu_state *m, int g) { return g >= 0 && g < layout_count(m); }
+static int layout_k(menu_state *m, int g) {
+  if (!m->lay_page && g==HUD_EDIT_SHIFT && !m->custom_layout.shift_separate) return m->key_k[HUD_KEYS_RIGHT];
+  HudCustomTransform *t = layout_transform(m,g);
+  return t ? t->k : m->key_k[g];
+}
+static void layout_xy(menu_state *m, int g, int **x, int **y) {
+  HudCustomTransform *t = layout_transform(m,g);
+  if (t) { *x = &t->dx; *y = &t->dy; }
+  else { *x = &m->key_dx[g]; *y = &m->key_dy[g]; }
+}
+static void layout_dirty(menu_state *m, int g) {
+  if (m->lay_page) {
+    static const unsigned bits[HUD_RACE_GROUPS] = { CUSTOM_DIRTY_MAP, CUSTOM_DIRTY_RANK, CUSTOM_DIRTY_TIME, CUSTOM_DIRTY_METER };
+    if (g>=0 && g<HUD_RACE_GROUPS) m->custom_layout_dirty |= bits[g];
+  } else if (g==HUD_EDIT_SHIFT) m->custom_layout_dirty |= CUSTOM_DIRTY_SHIFT;
+  else if (g>=0 && g<HUD_KEY_GROUPS) m->key_layout_dirty |= 1u << g;
+}
+static void layout_clamp(menu_state *m, int g) {
+  int *x, *y; layout_xy(m,g,&x,&y);
+  float dx = (float)*x, dy = (float)*y;
+  if (m->lay_page) hud_race_layout_clamp(g, layout_k(m,g)*0.01f, &dx, &dy);
+  else hud_layout_clamp_mode(g, m->gyro, layout_k(m,g)*0.01f, &dx, &dy);
+  *x = (int)floorf(dx + 0.5f); *y = (int)floorf(dy + 0.5f);
+}
+static void layout_apply(const menu_state *m) {
+  for (int g=0; g<HUD_KEY_GROUPS; ++g) hud_layout_set(g,m->key_k[g]*0.01f,m->key_dx[g],m->key_dy[g]);
+  const HudCustomLayout *c = &m->custom_layout;
+  hud_set_stick_deadzone_percent(c->stick_deadzone_percent);
+  hud_shift_layout_set(c->shift_separate,c->shift.k*0.01f,c->shift.dx,c->shift.dy);
+  const HudCustomTransform *t[4] = { &c->map, &c->rank, &c->timer, &c->meter };
+  for (int g=0; g<HUD_RACE_GROUPS; ++g) hud_race_layout_set(g,t[g]->k*0.01f,t[g]->dx,t[g]->dy);
+}
+static void layout_enter(menu_state *m) {
+  go(m,MENU_LAYOUT); m->lay_drag=m->lay_tap=0; m->lay_touch=0;
+  m->lay_page=0; m->lay_sel=HUD_KEYS_RIGHT; layout_apply(m);
+}
+static int layout_touch(menu_state *m, void *id, int phase, float x, float y) {
+  if (phase == TOUCH_BEGAN) {
+    if (!id || m->lay_touch || m->lay_tap || m->back) return 1;
+    int b=layout_button(x,y);
+    if (b==LAY_CENTER && (m->lay_page || m->gyro!=HUD_STEER_STICK || m->lay_sel!=HUD_KEYS_LEFT)) return 1;
+    if (b>=0) { m->lay_touch=id; m->lay_button_down=b+1; return 1; }
+    int handle=x>=392 && x<632 && y>=462 && y<492;
+    if (!handle && x>=LAY_PANEL[0] && x<=LAY_PANEL[0]+LAY_PANEL[2] && y>=LAY_PANEL[1] && y<=LAY_PANEL[1]+LAY_PANEL[3]) return 1;
+    if (!handle && hud_menu_key(x,y)==HUD_MENU_BACK) { m->lay_touch=id; m->lay_button_down=LAY_BUTTONS+1; m->key_held=HUD_MENU_BACK; return 1; }
+    layout_apply(m);
+    int g=handle ? m->lay_sel : (m->lay_page ? hud_race_layout_hit(x,y) : hud_layout_hit_mode(m->gyro,x,y));
+    if (!layout_valid(m,g)) return 1;
+    m->lay_sel=g; m->lay_drag=1; m->lay_touch=id;
+    if (!m->lay_page && g==HUD_EDIT_SHIFT) {
+      m->lay_shift_old_separate=m->custom_layout.shift_separate;
+      if (!m->lay_shift_old_separate) {
+        m->custom_layout.shift.k=m->key_k[HUD_KEYS_RIGHT];
+        m->custom_layout.shift.dx=m->key_dx[HUD_KEYS_RIGHT]; m->custom_layout.shift.dy=m->key_dy[HUD_KEYS_RIGHT];
+      }
+    }
+    int *dx,*dy; layout_xy(m,g,&dx,&dy);
+    m->lay_old_dx=*dx; m->lay_old_dy=*dy; m->lay_x=x; m->lay_y=y;
+    return 1;
+  }
+  if (!id || id!=m->lay_touch) return 1;
+  if (m->lay_drag && layout_valid(m,m->lay_sel)) {
+    int g=m->lay_sel,*dx,*dy; layout_xy(m,g,&dx,&dy);
+    if (phase==TOUCH_CANCELLED) {
+      *dx=m->lay_old_dx; *dy=m->lay_old_dy;
+      if (!m->lay_page && g==HUD_EDIT_SHIFT) m->custom_layout.shift_separate=m->lay_shift_old_separate;
+    } else if (phase==TOUCH_MOVED || phase==TOUCH_ENDED) {
+      if (x==m->lay_x && y==m->lay_y) {
+        /* A tap, or a drag returned to its origin, must preserve exact identity. */
+        *dx=m->lay_old_dx; *dy=m->lay_old_dy;
+      } else {
+        *dx=(int)floorf(m->lay_old_dx+x-m->lay_x+0.5f);
+        *dy=(int)floorf(m->lay_old_dy+y-m->lay_y+0.5f);
+        layout_clamp(m,g);
+      }
+      int changed=*dx!=m->lay_old_dx || *dy!=m->lay_old_dy;
+      if (!m->lay_page && g==HUD_EDIT_SHIFT) m->custom_layout.shift_separate=m->lay_shift_old_separate || changed;
+      if (phase==TOUCH_ENDED && changed) layout_dirty(m,g);
+    }
+    layout_apply(m);
+  } else if (m->lay_button_down==LAY_BUTTONS+1) {
+    int on=hud_menu_key(x,y)==HUD_MENU_BACK;
+    if (phase==TOUCH_MOVED) m->key_held=on ? HUD_MENU_BACK : 0;
+    if (phase==TOUCH_ENDED && on) m->back=1;
+  } else if (phase==TOUCH_ENDED && layout_button(x,y)+1==m->lay_button_down) m->lay_tap=m->lay_button_down;
+  if (phase==TOUCH_ENDED || phase==TOUCH_CANCELLED) { m->lay_drag=0; m->lay_touch=0; m->lay_button_down=0; m->key_held=0; }
+  return 1;
+}
+static void layout_reset_group(menu_state *m,int g) {
+  HudCustomTransform *t=layout_transform(m,g);
+  if (t) { t->k=100; t->dx=t->dy=0; }
+  else { m->key_k[g]=100; m->key_dx[g]=m->key_dy[g]=0; }
+  if (!m->lay_page) layout_clamp(m,g); /* HUD identity is the original, even off the conservative bounds. */
+  layout_dirty(m,g);
+}
+static void layout_step(menu_state *m,int back) {
+  int b=m->lay_tap-1; m->lay_tap=0;
+  if (back || b==LAY_DONE) {
+    if (m->lay_drag && m->lay_touch) layout_touch(m,m->lay_touch,TOUCH_CANCELLED,0,0);
+    snd_menu(SND_CANCEL); m->lay_drag=0; m->lay_touch=0; go(m,MENU_OPTION); return;
+  }
+  if (b==LAY_PAGE) { m->lay_page=!m->lay_page; m->lay_sel=m->lay_page ? HUD_RACE_MAP : HUD_KEYS_RIGHT; }
+  else if (b==LAY_PREV || b==LAY_NEXT) m->lay_sel=(m->lay_sel+layout_count(m)+(b==LAY_NEXT ? 1 : -1))%layout_count(m);
+  else if (b==LAY_CENTER && !m->lay_page && m->gyro==HUD_STEER_STICK && m->lay_sel==HUD_KEYS_LEFT) {
+    m->stick_center_mode = !m->stick_center_mode;
+    m->stick_center_dirty = 1; m->stick_center_retries = 0; m->stick_center_retry_frames = 0;
+  } else if (b==LAY_DEAD_MINUS || b==LAY_DEAD_PLUS) {
+    if (!m->lay_page && m->gyro==HUD_STEER_STICK && m->lay_sel==HUD_KEYS_LEFT) {
+      int n=m->custom_layout.stick_deadzone_percent+(b==LAY_DEAD_PLUS ? 1 : -1);
+      if (n>=0 && n<=50) { m->custom_layout.stick_deadzone_percent=n; m->custom_layout_dirty |= CUSTOM_DIRTY_DEADZONE; }
+    }
+  } else if (b==LAY_SMALLER || b==LAY_BIGGER) {
+    int g=m->lay_sel;
+    if (!m->lay_page && g==HUD_EDIT_SHIFT && !m->custom_layout.shift_separate) {
+      m->custom_layout.shift.k=m->key_k[HUD_KEYS_RIGHT]; m->custom_layout.shift.dx=m->key_dx[HUD_KEYS_RIGHT]; m->custom_layout.shift.dy=m->key_dy[HUD_KEYS_RIGHT];
+    }
+    int k=layout_k(m,g)+(b==LAY_BIGGER ? LAY_K_STEP : -LAY_K_STEP);
+    if (m->lay_page && k > layout_k(m,g) && k*0.01f > hud_race_layout_max_scale(g)) return;
+    if (k >= (int)(HUD_KEY_K_MIN*100+0.5f) && k <= (int)(HUD_KEY_K_MAX*100+0.5f)) {
+      HudCustomTransform *t=layout_transform(m,g); if (t) t->k=k; else m->key_k[g]=k;
+      if (!m->lay_page && g==HUD_EDIT_SHIFT) m->custom_layout.shift_separate=1;
+      layout_clamp(m,g); layout_dirty(m,g);
+    }
+  } else if (b==LAY_RESET) {
+    if (!m->lay_page && m->lay_sel==HUD_EDIT_SHIFT) {
+      m->custom_layout.shift_separate=0;
+      m->custom_layout.shift.k=m->key_k[HUD_KEYS_RIGHT]; m->custom_layout.shift.dx=m->key_dx[HUD_KEYS_RIGHT]; m->custom_layout.shift.dy=m->key_dy[HUD_KEYS_RIGHT];
+      m->custom_layout_dirty |= CUSTOM_DIRTY_SHIFT;
+    } else layout_reset_group(m,m->lay_sel);
+  } else if (b==LAY_RESET_ALL) {
+    if (m->lay_page) for (int i=0;i<HUD_RACE_GROUPS;++i) layout_reset_group(m,i);
+    else {
+      for (int i=0;i<HUD_KEY_GROUPS;++i) layout_reset_group(m,i);
+      m->custom_layout.shift_separate=0; m->custom_layout.shift.k=100; m->custom_layout.shift.dx=m->custom_layout.shift.dy=0;
+      m->custom_layout.stick_deadzone_percent=8; m->custom_layout_dirty |= CUSTOM_DIRTY_SHIFT | CUSTOM_DIRTY_DEADZONE;
+      if (m->stick_center_mode != HUD_STICK_FLOAT) {
+        m->stick_center_mode=HUD_STICK_FLOAT; m->stick_center_dirty=1;
+        m->stick_center_retries=0; m->stick_center_retry_frames=0;
+      }
+    }
+  }
+  layout_apply(m);
+}
+static void layout_text_mid(const char *s,float y,float px,float r,float g,float b) {
+  hud_ui_text(s,512.0f-0.5f*hud_ui_text_width(s,px),y,px,r,g,b,1);
+}
+static void draw_layout(const menu_state *cm,int clock,float screen_w,float screen_h) {
+  menu_state *m=(menu_state *)cm;
+  static const char *const keys[]={"TOP KEYS","LEFT KEYS","RIGHT KEYS","SHIFT"};
+  static const char *const race[]={"MAP","RANK","TIME","METER"};
+  draw_back(ID.bg,clock%600,1); anm_fill(0,0,0,0.6f); layout_apply(m);
+  if (m->lay_page) hud_draw_race_layout(screen_w,screen_h,m->lay_sel);
+  else hud_draw_layout_mode(screen_w,screen_h,m->gyro,m->lay_sel);
+  hud_ui_begin(screen_w,screen_h); const float *p=LAY_PANEL;
+  hud_ui_rect(p[0],p[1],p[2],p[3],0.03f,0.04f,0.06f,0.90f);
+  hud_ui_rect(p[0],p[1],p[2],3,1,0.42f,0.05f,0.95f);
+  layout_text_mid("LAYOUT EDITOR",p[1]+10,3,1,1,1);
+  static const char *const label[]={"KEYS / HUD","<",">","-","+","-","+","RESET GROUP","RESET ALL","DONE","CENTER"};
+  for (int b=0;b<LAY_BUTTONS;++b) { const float *r=LAY_BUTTON[b]; float px=2.2f;
+    if ((b==LAY_DEAD_MINUS || b==LAY_DEAD_PLUS) &&
+        (m->lay_page || m->gyro!=HUD_STEER_STICK || m->lay_sel!=HUD_KEYS_LEFT)) continue;
+    if (b==LAY_CENTER && (m->lay_page || m->gyro!=HUD_STEER_STICK || m->lay_sel!=HUD_KEYS_LEFT)) continue;
+    if (b==LAY_CENTER) px=1.7f;
+    const char *text=b==LAY_CENTER ? (m->stick_center_mode ? "STATIC - TAP FOR FLOAT" : "FLOAT - TAP FOR STATIC") :
+                     b==LAY_RESET_ALL ? (m->lay_page ? "RESET HUD" : "RESET KEYS") : label[b];
+    hud_ui_button(r[0],r[1],r[2],r[3],m->lay_tap==b+1);
+    hud_ui_text(text,r[0]+0.5f*(r[2]-hud_ui_text_width(text,px)),r[1]+0.5f*(r[3]-7*px),px,1,1,1,1);
+  }
+  int g=layout_valid(m,m->lay_sel)?m->lay_sel:0; char line[80];
+  snprintf(line,sizeof line,"%s: %s",m->lay_page?"HUD":"KEYS",m->lay_page?race[g]:keys[g]); layout_text_mid(line,293,2,1,0.65f,0.2f);
+  snprintf(line,sizeof line,"SIZE %d PCT",layout_k(m,g)); layout_text_mid(line,338,2,1,1,1);
+  if (!m->lay_page && m->gyro==HUD_STEER_STICK && g==HUD_KEYS_LEFT) {
+    snprintf(line,sizeof line,"DEADZONE %d PCT",m->custom_layout.stick_deadzone_percent); layout_text_mid(line,383,2,1,1,1);
+  } else if (!m->lay_page && g==HUD_EDIT_SHIFT) layout_text_mid(m->custom_layout.shift_separate?"SHIFT SEPARATE":"SHIFT FOLLOWS RIGHT",383,1.8f,1,1,1);
+  else layout_text_mid("DRAG GROUP TO MOVE",383,1.8f,1,1,1);
+  hud_ui_button(392,462,240,30,m->lay_drag);
+  layout_text_mid("DRAG TO MOVE",469,2,1,1,1);
+  if (m->stick_center_dirty && m->stick_center_status==2) layout_text_mid("UNKNOWN CENTER FILE - NOT SAVED",493,1.3f,1,0.4f,0.2f);
+  else if (m->stick_center_dirty && m->stick_center_retries) layout_text_mid("CENTER SAVE FAILED",493,1.5f,1,0.4f,0.2f);
+  else if (m->key_save_failed && m->custom_layout_status==HUD_CUSTOM_UNSUPPORTED) layout_text_mid("KEY SAVE ERROR / NEWER HUD",493,1.5f,1,0.4f,0.2f);
+  else if (m->key_save_failed && m->custom_layout_dirty && m->custom_layout_status!=HUD_CUSTOM_OK) layout_text_mid("KEY AND HUD SAVE ERROR",493,1.5f,1,0.4f,0.2f);
+  else if (m->key_save_failed) layout_text_mid("KEY SAVE FAILED - RETRYING",493,1.5f,1,0.4f,0.2f);
+  else if (m->custom_layout_status==HUD_CUSTOM_UNSUPPORTED) layout_text_mid("NEWER LAYOUT - NOT SAVED",493,1.5f,1,0.4f,0.2f);
+  else if (m->custom_layout_dirty && m->custom_layout_status!=HUD_CUSTOM_OK) layout_text_mid("SAVE FAILED - RETRYING",493,1.5f,1,0.4f,0.2f);
+  else if (m->custom_layout_status==HUD_CUSTOM_CORRUPT) layout_text_mid("BAD LAYOUT - DEFAULTS LOADED",493,1.5f,1,0.4f,0.2f);
+  else if (m->custom_layout_status==HUD_CUSTOM_IO_ERROR || m->custom_layout_status==HUD_CUSTOM_INVALID) layout_text_mid("LAYOUT ERROR - DEFAULTS LOADED",493,1.5f,1,0.4f,0.2f);
+  hud_ui_end();
+}
+#else
 enum { LAY_SMALLER, LAY_BIGGER, LAY_RESET, LAY_DONE, LAY_BUTTONS };
 static const float LAY_PANEL[4] = { 272, 228, 480, 270 };
 static const float LAY_BUTTON[LAY_BUTTONS][4] = { { 296, 356, 110, 56 }, { 618, 356, 110, 56 }, { 296, 426, 204, 56 },
@@ -1683,7 +1934,7 @@ static int layout_button(float x, float y) {
 
 static void layout_clamp(menu_state *m, int g) {
   float dx = (float)m->key_dx[g], dy = (float)m->key_dy[g];
-  hud_layout_clamp(g, m->gyro, (float)m->key_k[g] * 0.01f, &dx, &dy);
+  hud_layout_clamp_mode(g, m->gyro, (float)m->key_k[g] * 0.01f, &dx, &dy);
   m->key_dx[g] = (int)floorf(dx + 0.5f), m->key_dy[g] = (int)floorf(dy + 0.5f);
 }
 
@@ -1710,7 +1961,7 @@ static int layout_touch(menu_state *m, void *id, int phase, float x, float y) {
     if (x >= LAY_PANEL[0] && x <= LAY_PANEL[0]+LAY_PANEL[2] && y >= LAY_PANEL[1] && y <= LAY_PANEL[1]+LAY_PANEL[3]) return 1;
     if (hud_menu_key(x, y) == HUD_MENU_BACK) { m->lay_touch = id; m->lay_button_down = LAY_BUTTONS + 1; m->key_held = HUD_MENU_BACK; return 1; }
     layout_apply(m);
-    int g = hud_layout_hit(m->gyro, x, y);
+    int g = hud_layout_hit_mode(m->gyro, x, y);
     if (g < 0) return 1;
     m->lay_sel = g; m->lay_drag = 1; m->lay_touch = id;
     m->lay_old_dx = m->key_dx[g]; m->lay_old_dy = m->key_dy[g];
@@ -1724,7 +1975,7 @@ static int layout_touch(menu_state *m, void *id, int phase, float x, float y) {
     else if (phase == TOUCH_MOVED || phase == TOUCH_ENDED) {
       m->key_dx[g] = (int)floorf(x - m->lay_x + 0.5f); m->key_dy[g] = (int)floorf(y - m->lay_y + 0.5f);
       layout_clamp(m, g);
-      if (phase == TOUCH_ENDED && (m->key_dx[g] != m->lay_old_dx || m->key_dy[g] != m->lay_old_dy)) m->key_layout_dirty = 1;
+      if (phase == TOUCH_ENDED && (m->key_dx[g] != m->lay_old_dx || m->key_dy[g] != m->lay_old_dy)) m->key_layout_dirty |= 1u << g;
     }
     layout_apply(m);
   } else if (m->lay_button_down == LAY_BUTTONS + 1) {
@@ -1752,11 +2003,11 @@ static void layout_step(menu_state *m, int back) {
     snd_menu(SND_CURSOR);
     m->key_k[g] = k;
     layout_clamp(m, g);
-    m->key_layout_dirty = 1;
+    m->key_layout_dirty |= 1u << g;
   } else if (b == LAY_RESET) {
     snd_menu(SND_SELECT);
     for (int i = 0; i < HUD_KEY_GROUPS; ++i) m->key_k[i] = 100, m->key_dx[i] = m->key_dy[i] = 0;
-    m->key_layout_dirty = 1;
+    m->key_layout_dirty |= (1u << HUD_KEY_GROUPS) - 1;
   }
   layout_apply(m);
 }
@@ -1769,7 +2020,7 @@ static void draw_layout(const menu_state *m, int clock, float screen_w, float sc
   draw_back(ID.bg, clock % 600, 1);
   anm_fill(0, 0, 0, 0.6f);
   layout_apply(m);
-  hud_draw_layout(screen_w, screen_h, m->gyro, m->lay_sel);
+  hud_draw_layout_mode(screen_w, screen_h, m->gyro, m->lay_sel);
   hud_ui_begin(screen_w, screen_h);
   const float *p = LAY_PANEL;
   hud_ui_rect(p[0], p[1], p[2], p[3], 0.03f, 0.04f, 0.06f, 0.82f);
@@ -1792,10 +2043,18 @@ static void draw_layout(const menu_state *m, int clock, float screen_w, float sc
   hud_ui_end();
 }
 
+#endif /* Android extended layout editor */
+
 /* the OPTION screen's key to KEY LAYOUT (its words the HUD's, over the bars like RESOLUTION's) */
-static void draw_option_layout_key(float screen_w, float screen_h) {
+static void draw_option_layout_key(const menu_state *m, float screen_w, float screen_h) {
   const float *r = OPT_LAYOUT_KEY, k = 1.6f;
   hud_ui_begin(screen_w, screen_h);
+  static const char *const steer_labels[4] = { "BUTTONS", "GYRO", "WHEEL", "STICK" };
+  for (int i = 0; i < 4; ++i) {
+    float cx = (300.0f + 84.0f * i + 42.0f) * k;
+    hud_ui_text(steer_labels[i], cx - 0.5f * hud_ui_text_width(steer_labels[i], 2.0f),
+                OPT_STEER_Y * k - 7.0f, 2.0f, 1, 1, 1, m->gyro == i ? 1.0f : 0.3f);
+  }
   hud_ui_button(r[0] * k, r[1] * k, r[2] * k, r[3] * k, 0);
   const char *s = "KEY LAYOUT >";
   hud_ui_text(s, (r[0] + 0.5f * r[2]) * k - 0.5f * hud_ui_text_width(s, 2.5f), (r[1] + 0.5f * r[3]) * k - 3.5f * 2.5f, 2.5f, 1,
@@ -1806,13 +2065,13 @@ static void draw_option_layout_key(float screen_w, float screen_h) {
 static void option_step(menu_state *m, int tap, int key) {
   if (key) {
     int s = m->gyro_sens + key;
-    if (m->gyro && s >= 1 && s <= 10) option_set(m, &m->gyro_sens, s);
+    if (m->gyro == HUD_STEER_GYRO && s >= 1 && s <= 10) option_set(m, &m->gyro_sens, s);
     return;
   }
   if (!tap) return;
   const float *lk = OPT_LAYOUT_KEY;
   if (m->tap_x >= lk[0] && m->tap_x < lk[0]+lk[2] && m->tap_y >= lk[1] && m->tap_y < lk[1]+lk[3]) { snd_menu(SND_SELECT); layout_enter(m); return; }
-  int k = option_chip(m, O_BUTTONS, OPT_STEER_Y);
+  int k = menu_steer_hit(m->tap_x, m->tap_y);
   if (k >= 0) {
     int old_gyro = m->gyro;
     option_set(m, &m->gyro, k);
@@ -1838,7 +2097,7 @@ static void option_step(menu_state *m, int tap, int key) {
   if (k >= 0) option_set(m, &m->bm_on, !k);
   option_res_step(m);
   /* a light of the gauge: that sensitivity */
-  if (m->gyro && m->tap_y >= OPT_SENS_Y - OPT_ROW_HALF && m->tap_y < OPT_SENS_Y + OPT_ROW_HALF) {
+  if (m->gyro == HUD_STEER_GYRO && m->tap_y >= OPT_SENS_Y - OPT_ROW_HALF && m->tap_y < OPT_SENS_Y + OPT_ROW_HALF) {
     int i = (int)floorf((m->tap_x - OPT_CHIP_X) / OPT_LIGHT_DX);
     if (i >= 0 && i < 10) option_set(m, &m->gyro_sens, i + 1);
   }
@@ -1853,11 +2112,9 @@ static void draw_option(const menu_state *m, int clock, int bars) {
   anm_draw_sprite(anm_sprite(T_SET_BAND), -192.0f, OPT_STEER_Y - 20.0f, 0.5f);
   float x[2];
   anm_draw_sprite(anm_sprite(OPT_TEXT + O_STEERING), 16.0f, OPT_STEER_Y - 10.0f, 1);
-  option_chips(O_BUTTONS, x);
-  for (int k = 0; k < 2; ++k)
-    anm_draw_sprite(anm_sprite(OPT_TEXT + O_BUTTONS + k), x[k], OPT_STEER_Y - 15.0f, m->gyro == k ? 1.0f : 0.3f);
+
   /* the sensitivity: ten lights (the setting's gauge, lit by the s1..s3 colours) and its number */
-  float a = m->gyro ? 1.0f : 0.3f;
+  float a = m->gyro == HUD_STEER_GYRO ? 1.0f : 0.3f;
   anm_draw_sprite(anm_sprite(OPT_TEXT + O_SENS), 16.0f, OPT_SENS_Y - 10.0f, a);
   for (int i = 0; i < 10; ++i) {
     float gx = OPT_CHIP_X + OPT_LIGHT_DX * ((float)i + 0.5f) - 32.0f, gy = OPT_SENS_Y - 32.0f;
@@ -1892,7 +2149,7 @@ static void draw_option(const menu_state *m, int clock, int bars) {
   draw_topbar(bars, 1, &title);
   anm_draw(ID.bottom, bars, 1);
   int hint = anm_sprite(OPT_TEXT + O_TILT);
-  if (!bars && m->gyro)
+  if (!bars && m->gyro == HUD_STEER_GYRO)
     anm_draw_sprite(hint, 320.0f - anm_sprite_width(hint) * 0.5f, 427.0f, 0.75f + 0.25f * cosf((float)clock * 0.1f));
 }
 
@@ -2661,8 +2918,9 @@ int menu_card_choice_available(const menu_state *m, int row, int choice) {
   if (row) {
 #if defined(__ANDROID__) || defined(WMMT_BGM_TEST)
     extern int android_bgm_group_available(int group);
-    return android_bgm_group_available(choice) && m->card_born[m->maker][m->car] == born &&
-           (m->st_bonus_car[m->maker][m->car] & (choice == 1 ? 1 : 2));
+    /* The current owned card was verified above; music does not require story rewards.
+     * The stored choice remains bound to its card's birth ID by the commit/read paths. */
+    return android_bgm_group_available(choice);
 #else
     return 0; /* no independently verified extra resource provider */
 #endif
@@ -3013,10 +3271,31 @@ void menu_vs_closed(menu_state *m, const char *note) {
   snprintf(m->vs.note, sizeof m->vs.note, "%s", note);
 }
 
+/* A peer left: the host and connection survive, but the old race and votes do not. */
+void menu_vs_aborted(menu_state *m, const char *note) {
+  m->vs.state = MENU_VS_LOBBY;
+  m->vs.start = m->vs.area_go = m->vs.day = 0;
+  m->vs.connect = m->vs.join = 0;
+  m->vs.loaded = m->vs.wait_others = 0;
+  m->vs.match_t = m->vs.match_n = m->vs.match_me = m->vs.match_played = 0;
+  m->vs.area_final = m->vs.day_final = -1;
+  m->vs.voted = m->vs.vote = m->vs.day_voted = 0;
+  m->finish_story = m->finish = m->pause.open = 0;
+  go(m, MENU_VS);
+  m->t = 0;
+  m->bars = 1;
+  m->tap = m->key = m->key_held = m->back = m->leaving = 0;
+  snprintf(m->vs.note, sizeof m->vs.note, "%s", note);
+}
+
 /* The race left with the screen white (the pause menu's NO) or black (its end): back on the
  * time zone and BGM select (a story race: the game mode select), out of the white like the car select from the title, or out of
  * the black as from the course select */
 static void back_from_race(menu_state *m, int white) {
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+  if (m->game != MENU_GAME_VS) pre_race_tune_clear(&m->pre_tune);
+  m->pre_tune_setting = 0;
+#endif
   /* a story race goes back to the game mode select; one whose select runs a second race on
    * (menu_finish_story's next) to that race's title */
   if (m->finish_story == 3) {
@@ -3699,6 +3978,13 @@ void menu_finish_draw(const menu_state *m) {
   else if (m->finish_story >= 5) {
     int a = m->finish_story == 5 ? ID.win : ID.lose, len = m->finish_story == 5 ? anm_frames(a) : ST_LOSE_LEN;
     anm_draw(a, t < len ? t : len - 1, 1);
+    if (m->vs.last_place > 0 && m->vs.last_n >= m->vs.last_place) {
+      char rank[48];
+      snprintf(rank, sizeof rank, "PLACE %d OF %d", m->vs.last_place, m->vs.last_n);
+      hud_ui_begin(1024, 768);
+      hud_ui_text(rank, 512.0f - 0.5f * hud_ui_text_width(rank, 4.0f), 620.0f, 4.0f, 1, 1, 1, 1);
+      hud_ui_end();
+    }
   } else if (m->finish_story == 1 || m->finish_story == 2) {
     int a = m->finish_story == 1 ? ID.win : ID.lose, len = m->finish_story == 1 ? anm_frames(a) : ST_LOSE_LEN;
     anm_draw(a, t < len ? t : len - 1, 1);
@@ -3908,11 +4194,13 @@ static const int LV_BACKLIGHT[4] = { 0x1dbe, 0x1e69, 0x1ed8, 0x1cdd };
 static const int LV_WAKU[4] = { 0x1327, 0x1649, 0x1881, 0x1044 }; /* menu_p_st_lv_waku_<colour> (0x93fd020) */
 #define ST_NONE 99 /* a tap on nothing */
 
-static int st_loop(const menu_state *m) { return m->st_div / 5; }
-static int st_division(const menu_state *m) { return m->st_div % 5; }
+static int st_div_of(const menu_state *m) { return m->story_test > 0 ? m->story_test - 1 : m->st_div; }
+static int st_loop(const menu_state *m) { return st_div_of(m) / 5; }
+static int st_division(const menu_state *m) { return st_div_of(m) % 5; }
 
 /* clV386CardData::isStoryClear (0x86c5524): the divisions before the card's are cleared */
 static int st_cleared(const menu_state *m, int n) {
+  if (m->story_test) return 0;
   int r = n % 100, d = r / 20;
   if (d != st_division(m)) return d < st_division(m);
   return (m->st_bits >> (r % 20)) & 1;
@@ -3934,6 +4222,10 @@ typedef struct { int level[4], ep[4][5], lv, slot; } st_states;
 static void st_states_of(const menu_state *m, st_states *s) {
   int base = 20 * st_division(m), found = 0;
   memset(s, 0, sizeof *s);
+  if (m->story_test) {
+    for (int lv = 0; lv < 4; ++lv) { s->level[lv] = 1; for (int k = 0; k < 5; ++k) s->ep[lv][k] = 1; }
+    return;
+  }
   if (st_division(m) > 0 && st_loop(m) == 0) {
     for (int lv = 0; lv < 4 && !found; ++lv) {
       s->level[lv] = 1;
@@ -3963,7 +4255,7 @@ static void st_states_of(const menu_state *m, st_states *s) {
 }
 
 void menu_story_clear(menu_state *m, int n) {
-  if (n < 0) return;
+  if (n < 0 || m->story_test) return;
   int r = n % 100;
   if (r / 20 == st_division(m)) m->st_bits |= 1 << (r % 20);
   /* the division's last episode: setStoryClearDivCount(+1), which clears the bits */
@@ -4022,6 +4314,85 @@ static int st_tap(const menu_state *m) {
   }
   if (best < 0) return ST_NONE;
   return best == m->sel ? 0 : best < m->sel ? -1 : 1;
+}
+
+/* ---- UNLOCK ALL CHAPTERS (Allan 10-31: the testers' switch, menu.h story_test, as a key):
+ * in the level select's bottom bar between its arrow keys (640 x 480; the bar's keys at
+ * 22..133 and 507..618), a tap turns it on at the save's own page; on, the key shows the page
+ * (1-20 .. 81-100, the second loop's after) with < and > either side to step through them, a
+ * tap on the page turns it off. Its races change no progress. ---- */
+static const float CH_KEY[4] = { 205, 407.5f, 230, 35 }, CH_PREV[4] = { 143, 407.5f, 52, 35 }, CH_NEXT[4] = { 445, 407.5f, 52, 35 };
+static int ch_hit(const menu_state *m, const float *r) {
+  return m->tap_x >= r[0] && m->tap_x < r[0] + r[2] && m->tap_y >= r[1] - 6 && m->tap_y < r[1] + r[3] + 6;
+}
+static void chapters_page(menu_state *m, int page) {
+  st_states s;
+  m->story_test = page;
+  m->options_dirty = 1;
+  st_states_of(m, &s);
+  m->sel = s.lv;
+  m->card_t = FADE;
+}
+static int chapters_tap(menu_state *m) {
+  if (ch_hit(m, CH_KEY)) {
+    snd_menu(SND_SELECT);
+    chapters_page(m, m->story_test ? 0 : (m->st_div > 9 ? 9 : m->st_div) + 1);
+    return 1;
+  }
+  if (m->story_test && (ch_hit(m, CH_PREV) || ch_hit(m, CH_NEXT))) {
+    int to = m->story_test + (ch_hit(m, CH_NEXT) ? 1 : -1);
+    if (to < 1 || to > 10) return 1;
+    snd_menu(SND_CURSOR);
+    chapters_page(m, to);
+    return 1;
+  }
+  return 0;
+}
+static void draw_chapters(const menu_state *m, float screen_w, float screen_h) {
+  const float k = 1.6f;
+  char t[48];
+  if (m->story_test) {
+    int p = m->story_test - 1;
+    snprintf(t, sizeof t, "%sCHAPTERS %d-%d", p >= 5 ? "2ND " : "", 20 * (p % 5) + 1, 20 * (p % 5) + 20);
+  } else {
+    snprintf(t, sizeof t, "UNLOCK ALL CHAPTERS");
+  }
+  hud_ui_begin(screen_w, screen_h);
+  float px = 3.0f;
+  while (px > 2.0f && hud_ui_text_width(t, px) > (CH_KEY[2] - 10.0f) * k) px -= 0.25f;
+  hud_ui_button(CH_KEY[0] * k, CH_KEY[1] * k, CH_KEY[2] * k, CH_KEY[3] * k, 0);
+  hud_ui_text(t, (CH_KEY[0] + 0.5f * CH_KEY[2]) * k - 0.5f * hud_ui_text_width(t, px), (CH_KEY[1] + 0.5f * CH_KEY[3]) * k - 3.5f * px, px,
+              1, m->story_test ? 0.8f : 1, m->story_test ? 0.3f : 1, 1);
+  if (m->story_test) {
+    const float *r[2] = { CH_PREV, CH_NEXT };
+    const char *a[2] = { "<", ">" };
+    for (int i = 0; i < 2; ++i) {
+      int on = i ? m->story_test < 10 : m->story_test > 1;
+      hud_ui_button(r[i][0] * k, r[i][1] * k, r[i][2] * k, r[i][3] * k, 0);
+      hud_ui_text(a[i], (r[i][0] + 0.5f * r[i][2]) * k - 0.5f * hud_ui_text_width(a[i], 4.0f), (r[i][1] + 0.5f * r[i][3]) * k - 14.0f, 4.0f,
+                  1, 1, 1, on ? 1.0f : 0.3f);
+    }
+  }
+  hud_ui_end();
+}
+
+/* ---- the time attack's TRAFFIC key: the course select's bottom bar, in its middle (as
+ * UNLOCK ALL CHAPTERS), a tap turns the traffic on or off for the race ---- */
+static int traffic_tap(menu_state *m) {
+  if (!ch_hit(m, CH_KEY)) return 0;
+  snd_menu(SND_CURSOR);
+  m->ta_traffic = !m->ta_traffic;
+  m->options_dirty = 1;
+  return 1;
+}
+static void draw_traffic(const menu_state *m, float screen_w, float screen_h) {
+  const float k = 1.6f, px = 3.0f;
+  const char *t = m->ta_traffic ? "TRAFFIC: ON" : "TRAFFIC: OFF";
+  hud_ui_begin(screen_w, screen_h);
+  hud_ui_button(CH_KEY[0] * k, CH_KEY[1] * k, CH_KEY[2] * k, CH_KEY[3] * k, 0);
+  hud_ui_text(t, (CH_KEY[0] + 0.5f * CH_KEY[2]) * k - 0.5f * hud_ui_text_width(t, px), (CH_KEY[1] + 0.5f * CH_KEY[3]) * k - 3.5f * px, px,
+              1, m->ta_traffic ? 0.8f : 1, m->ta_traffic ? 0.3f : 1, 1);
+  hud_ui_end();
 }
 
 static void st_step(menu_state *m, int tap, int key) {
@@ -4893,12 +5264,20 @@ void menu_init(menu_state *m) {
   m->zone = 0;
   m->zones = 1;
   menu_garage_reset(m);
-  for (int g=0; g<3; ++g) m->key_k[g]=100, m->key_dx[g]=m->key_dy[g]=0;
+  for (int g=0; g<3; ++g) {
+    m->key_k[g]=m->key_base_k[g]=100;
+    m->key_dx[g]=m->key_dy[g]=m->key_base_dx[g]=m->key_base_dy[g]=0;
+  }
   m->lay_sel = HUD_KEYS_RIGHT; m->lay_touch = 0; m->key_layout_dirty = 0;
+  m->key_retry_frames=0; m->key_save_failed=0;
+#if defined(__ANDROID__) || defined(WMMT_HUD_CUSTOM_TEST)
+  hud_custom_default(&m->custom_layout);
+  m->custom_layout_base=m->custom_layout;
+  m->custom_layout_dirty=0; m->custom_layout_status=HUD_CUSTOM_OK; m->lay_page=0;
+#endif
   m->gyro = 0, m->gyro_sens = 5, m->over_on = 1, m->sharp_on = 1, m->ao_on = 1, m->bm_on = 1;
   /* (the SSAO off: its 20 ms on the Mi 6 cost the 60 fps) */
   m->hd_tex = 1, m->bloom_on = 1, m->ssao_on = 0, m->wet_on = 1, m->paint_on = 1, m->aa4 = 1;
-  m->enhance_on = 1;
   m->garage_changed = 0;
   m->story_new_pending = 0;
   m->game = MENU_GAME_TA;
@@ -4951,6 +5330,10 @@ void menu_garage_reset(menu_state *m) {
 }
 
 static void go(menu_state *m, int screen) {
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+  m->pre_tune_car_touch = NULL;
+  m->pre_tune_car_inside = 0;
+#endif
   m->screen = screen;
   m->pre_quiet = 0;
   m->t = 0;
@@ -4962,6 +5345,10 @@ static void go(menu_state *m, int screen) {
 }
 
 void menu_open(menu_state *m) {
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+  pre_race_tune_clear(&m->pre_tune);
+  m->pre_tune_setting = 0;
+#endif
   car_select_enter(m, m->game != MENU_GAME_TA ? MENU_GAME : MENU_MODE);
   m->bars = 1;
   m->tap = m->back = m->leaving = 0;
@@ -4986,6 +5373,27 @@ void menu_movie_done(menu_state *m) {
 }
 
 void menu_touch(menu_state *m, void *id, int phase, float x, float y) {
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+  if (pre_tune_context(m)) {
+    float px = x * 640.0f / 1024.0f, py = y * 480.0f / 768.0f;
+    int inside = px >= SET_CAR_X0 && px < SET_CAR_X1 && py >= SET_CAR_Y0 && py < SET_CAR_Y1;
+    if (id && id == m->pre_tune_car_touch) {
+      if (phase == TOUCH_MOVED) { m->pre_tune_car_inside = inside; return; }
+      if (phase == TOUCH_CANCELLED || phase == TOUCH_ENDED) {
+        int confirm = phase == TOUCH_ENDED && inside && m->pre_tune_car_inside && !m->deciding;
+        m->pre_tune_car_touch = NULL; m->pre_tune_car_inside = 0;
+        if (confirm) { m->tap_x = px; m->tap_y = py; m->tap = 1; }
+        return;
+      }
+    }
+    if (phase == TOUCH_BEGAN && inside) {
+      if (id && !m->pre_tune_car_touch && !m->deciding) {
+        m->pre_tune_car_touch = id; m->pre_tune_car_inside = 1;
+      }
+      return;
+    }
+  }
+#endif
   if (m->screen == MENU_LAYOUT) {
     /* Captures belonging to the previous page must not survive a transition. */
     if (id && (phase == TOUCH_ENDED || phase == TOUCH_CANCELLED)) {
@@ -5115,7 +5523,7 @@ void menu_touch(menu_state *m, void *id, int phase, float x, float y) {
   }
   /* the car setting's wheel key (in the gear key's place): the dress-up menu (a new car's
    * once its card is made) */
-  if (key == HUD_MENU_OPTION && m->screen == MENU_SETTING && !m->new_card && !m->deciding) {
+  if (key == HUD_MENU_OPTION && m->screen == MENU_SETTING && !pre_tune_context(m) && !m->new_card && !m->deciding) {
     m->dress = 1;
     m->key_held = key;
     return;
@@ -7463,7 +7871,7 @@ static void vs_step(menu_state *m, int back) {
     snd_menu(SND_CURSOR);
   } else if (b == VS_START) {
     int all = m->vs.n >= 2;
-    for (int i = 0; i < m->vs.n; ++i) all &= !m->vs.racing[i];
+    for (int i = 0; i < m->vs.n; ++i) all &= !m->vs.racing[i] && !m->vs.mismatch[i];
     if (!all) return;
     m->vs.start = 1;
     snd_menu(SND_SELECT);
@@ -7608,7 +8016,7 @@ static void draw_vs(const menu_state *m, int clock, int bars, float screen_w, fl
   vs_button(m, VS_START, r);
   if (host) {
     int ready = m->vs.n >= 2;
-    for (int i = 0; i < m->vs.n; ++i) ready &= !m->vs.racing[i];
+    for (int i = 0; i < m->vs.n; ++i) ready &= !m->vs.racing[i] && !m->vs.mismatch[i];
     hud_ui_button(r[0], r[1], r[2], r[3], m->vs.held == VS_START + 1);
     vs_centred(ready ? "START" : m->vs.n < 2 ? "WAITING FOR PLAYERS" : "WAITING FOR THE RACE", r, ready ? 5.0f : 3.0f, 1, 1, 1,
                ready ? 0.95f : 0.5f);
@@ -8307,6 +8715,11 @@ static void step(menu_state *m) {
         m->new_card = 1;
         m->tune_locked = 0;
       }
+      if (m->card_back == MENU_COLOR && m->card_color_pending) {
+        int k = menu_own_find(m, m->maker, m->car);
+        if (k >= 0) m->color = m->own[k].color;
+        m->card_color_pending = 0; m->all_parts = 0;
+      }
       if (m->card_back == MENU_GARAGE) garage_enter(m, m->own_sel);
       else car_select_enter(m, m->card_back == MENU_SETTING ? MENU_SETTING : MENU_COLOR);
       return;
@@ -8378,7 +8791,7 @@ static void step(menu_state *m) {
     return;
   }
   /* the car setting goes back to the save's cars: the car is one of them by now */
-  if (back && m->screen == MENU_SETTING && m->from < 0 && !m->save_skip && !m->new_card && m->own_sel >= 0) {
+  if (back && m->screen == MENU_SETTING && !pre_tune_context(m) && m->from < 0 && !m->save_skip && !m->new_card && m->own_sel >= 0) {
     snd_menu(SND_CANCEL);
     garage_enter(m, m->own_sel);
     return;
@@ -8405,6 +8818,36 @@ static void step(menu_state *m) {
     else car_select_enter(m, MENU_GAME);
     return;
   }
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+  if (m->screen == MENU_SETTING && m->pre_tune_setting) {
+    if (back) {
+      int origin = m->pre_tune_origin, song_line = m->pre_tune_bgm_sel, story_day = m->pre_tune_story_day;
+      pre_race_tune_clear(&m->pre_tune);
+      m->pre_tune_setting = 0;
+      snd_menu(SND_CANCEL);
+      if (origin == MENU_VS_SEL) {
+        go(m, MENU_VS_SEL);
+        m->sel = m->vs.kind;
+      } else if (origin == MENU_TEN_LEVEL) {
+        ten_level_enter(m);
+        m->sel = m->ten_level;
+      } else {
+        go(m, MENU_BGM);
+        m->story_day_select = story_day;
+        m->sel = song_line;
+        m->slide = m->card_t = 0; m->bars = 1;
+      }
+      return;
+    }
+    m->spin -= 0.3f;
+    if (key && pre_race_tune_step(&m->pre_tune, -key)) snd_menu(SND_CURSOR);
+    if (tap && m->tap_x >= SET_CAR_X0 && m->tap_x < SET_CAR_X1 &&
+        m->tap_y >= SET_CAR_Y0 && m->tap_y < SET_CAR_Y1 && pre_race_tune_confirm(&m->pre_tune)) {
+      snd_menu(SND_SELECT); m->deciding = FADE;
+    }
+    return;
+  }
+#endif
   if (back && m->screen == MENU_BGM && m->story_day_select && m->from < 0 && !m->slide) {
     snd_menu(SND_CANCEL);
     m->story_day_select = 0;
@@ -8454,6 +8897,8 @@ static void step(menu_state *m) {
     if (m->t >= PRE_LEN && m->ready && !m->deciding) m->deciding = FADE;
     return;
   }
+  if (m->screen == MENU_ST_LEVEL && tap && m->from < 0 && chapters_tap(m)) return;
+  if (m->screen == MENU_COURSE && tap && m->from < 0 && traffic_tap(m)) return;
   if (m->screen == MENU_ST_LEVEL || m->screen == MENU_ST_RIVAL) {
     st_step(m, tap, key);
     return;
@@ -8608,6 +9053,7 @@ int menu_update(menu_state *m, float dt) {
         card_enter(m, MENU_GARAGE);
       } else if (m->screen == MENU_CARD) {
         /* (a new card's setting came first: whether to keep it, then on) */
+        if (m->card_color_pending) { own_register(m); m->card_color_pending = 0; }
         if (m->card_back == MENU_SETTING) keep_enter(m);
         else car_select_enter(m, MENU_SETTING);
       } else if (m->screen == MENU_MAKER) {
@@ -8635,10 +9081,24 @@ int menu_update(menu_state *m, float dt) {
           m->tune_full[m->maker][m->car] = 0, m->tune_power[m->maker][m->car] = CAR_TUNE_MAX;
           car_select_enter(m, MENU_SETTING);
         } else {
-          own_register(m);
+          int k = menu_own_find(m, m->maker, m->car);
+          menu_own_store(m);
+          menu_own_load(m, k);
+          m->color = m->sel;
+          m->tune_locked = 1;
+          m->card_color_pending = 1;
           card_enter(m, MENU_COLOR);
         }
       } else if (m->screen == MENU_SETTING) {
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+        if (m->pre_tune_setting) {
+          int origin = m->pre_tune_origin;
+          m->pre_tune_setting = 0;
+          go(m, origin == MENU_VS_SEL ? MENU_VS : MENU_PRE);
+          if (origin == MENU_VS_SEL) { m->bars = 1; m->vs.held = 0; }
+        }
+        else
+#endif
         if (m->new_card) {
           own_register(m);
           card_enter(m, MENU_SETTING);
@@ -8660,9 +9120,14 @@ int menu_update(menu_state *m, float dt) {
         }
       } else if (m->screen == MENU_VS_SEL) {
         m->vs.kind = m->sel;
-        go(m, MENU_VS);
-        m->bars = 1;
-        m->vs.held = 0;
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+        if (!pre_tune_enter(m, MENU_VS_SEL, 0, 0))
+#endif
+        {
+          go(m, MENU_VS);
+          m->bars = 1;
+          m->vs.held = 0;
+        }
       } else if (m->screen == MENU_MODE) {
         m->official = m->sel;
         go(m, MENU_COURSE);
@@ -8684,26 +9149,47 @@ int menu_update(menu_state *m, float dt) {
          * song at random */
         m->ten_level = m->sel;
         m->zone = ten_night(m->ten_course, m->ten_level);
-        go(m, MENU_PRE);
         m->song = 1 + rand() % (card_bgm_lines(m) - 2);
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+        if (!pre_tune_enter(m, MENU_TEN_LEVEL, 0, 0))
+#endif
+          go(m, MENU_PRE);
       } else if (m->screen == MENU_ST_LEVEL) {
         m->st_level = m->sel;
         st_rival_enter(m);
       } else if (m->screen == MENU_ST_RIVAL) {
-        /* the episode's race: its start, its rivals; a song at random (there is no BGM
-         * select on the way) */
+        /* Original mseqStory initializes the selected episode's day and BGM before
+         * opening the selector; the player may still change both for this race. */
         m->story_n = 20 * st_division(m) + 5 * m->st_level + m->sel;
         m->story_pick = st_index(st_loop(m), m->story_n);
         if (m->story_pick > 111) m->story_pick = 111;
-        /* Port extension, not an asserted arcade behavior. */
         m->story_day_select = 1;
         m->story_zones_saved = m->zones;
         m->story_previous_zone = m->zone;
+#if defined(__ANDROID__) || defined(WMMT_STORY_DEFAULTS_TEST)
+        if (m->story_pick >= 0 && m->story_pick < 111) {
+          const story_default_row *defaults = &story_defaults_private[m->story_pick];
+          int group = card_bgm_set(m);
+          /* app.c checks the selected episode's city/night asset on the next frame;
+           * m->zones still describes the previous screen at this point. */
+          m->zone = defaults->day;
+          m->song = defaults->bgm[group];
+        } else {
+          /* An unsupported story index must not index private data or claim a default. */
+          m->zone = 0;
+          m->song = 0;
+        }
+#else
+        /* Host builds without original-derived private data retain the prior fallback. */
         m->zone = m->story_zone;
+        m->song = 1 + rand() % (card_bgm_lines(m) - 2);
+#endif
         go(m, MENU_BGM);
         m->slide = m->card_t = 0;
         m->bars = 1;
-        m->song = 1 + rand() % (card_bgm_lines(m) - 2);
+#if defined(__ANDROID__) || defined(WMMT_BGM_TEST) || defined(WMMT_STORY_DEFAULTS_TEST)
+        m->sel = m->song; /* changing this race does not overwrite the saved TA preference */
+#endif
       } else if (m->screen == MENU_ST_TUNE) {
         /* the part going on (seqStTuneEff) */
         int power = m->tune.choice, p0 = m->st_power[m->maker][m->car];
@@ -8753,9 +9239,16 @@ int menu_update(menu_state *m, float dt) {
         m->tg.maker = WM_MAKER[m->sel];
         tg_wheel_open_at(m, m->tg.maker);
       } else if (m->screen == MENU_BGM) {
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+        int story_day = m->story_day_select, bgm_sel = m->sel;
+#endif
         if (m->story_day_select) { m->story_day_select = 0; m->zones = m->story_zones_saved; }
         else if (!m->vs.day && m->game == MENU_GAME_TA) m->ta_zone = m->zone;
-        go(m, MENU_PRE);
+#if defined(__ANDROID__) || defined(WMMT_PRE_RACE_TEST)
+        if (!m->vs.day && pre_tune_enter(m, MENU_BGM, bgm_sel, story_day)) { /* edit before PRE */ }
+        else
+#endif
+          go(m, MENU_PRE);
       } else if (m->screen == MENU_PRE) {
         return 1;
       }
@@ -8904,10 +9397,9 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
   if (m->screen == MENU_OPTION) {
     if (m->t < FADE) fade = (float)(m->t + 1) / FADE;
     draw_option(m, clock, bars);
-    draw_option_layout_key(screen_w, screen_h);
+    draw_option_layout_key(m, screen_w, screen_h);
     if (m->res_row) draw_option_res(m, screen_w, screen_h);
-    if (m->hq_rows) draw_option_enhance(m, screen_w, screen_h);
-    hud_draw_menu_keys(screen_w, screen_h, m->key_held, m->gyro, 1);
+    hud_draw_menu_keys(screen_w, screen_h, m->key_held, m->gyro == HUD_STEER_GYRO, 1);
     anm_fill(0, 0, 0, 1.0f - fade);
     return;
   }
@@ -8915,8 +9407,9 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
     /* out of the colour select's black, and back into it */
     if (m->t < FADE && !m->deciding) fade = (float)(m->t + 1) / FADE;
     draw_setting(m, clock, draw3d, ctx, bars);
-    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, m->tune_full[m->maker][m->car], 1);
-    if (!m->deciding && !m->new_card) hud_draw_menu_dress(screen_w, screen_h, m->key_held == HUD_MENU_OPTION);
+    if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held,
+                                        pre_tune_context(m) || m->tune_full[m->maker][m->car], 1);
+    if (!m->deciding && !m->new_card && !pre_tune_context(m)) hud_draw_menu_dress(screen_w, screen_h, m->key_held == HUD_MENU_OPTION);
     anm_fill(0, 0, 0, 1.0f - fade);
     if (m->flash) anm_fill(1, 1, 1, (float)m->flash / FLASH_LEN);
     setting_warm();
@@ -8937,6 +9430,7 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
     if (m->screen == MENU_ST_LEVEL) draw_st_level(m, clock, fade, bars);
     else draw_st_rival(m, clock, fade, bars);
     if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, 1, 1);
+    if (!m->deciding && m->screen == MENU_ST_LEVEL && m->from < 0) draw_chapters(m, screen_w, screen_h);
     if (m->flash) anm_fill(1, 1, 1, (float)m->flash / FLASH_LEN);
     return;
   }
@@ -9104,4 +9598,5 @@ void menu_draw(const menu_state *m, float screen_w, float screen_h, void (*draw3
   anm_draw(ID.bottom, bars, fade);
   if (!m->deciding) hud_draw_menu_keys(screen_w, screen_h, m->key_held, 1, 1);
   if (m->flash) anm_fill(1, 1, 1, (float)m->flash / FLASH_LEN);
+  if (!m->deciding && m->screen == MENU_COURSE && m->from < 0) draw_traffic(m, screen_w, screen_h);
 }

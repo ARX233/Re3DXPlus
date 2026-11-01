@@ -34,7 +34,7 @@ int snd_init(const char *data_dir);
 /* The engine sound set of the car to drive (its ECarType, car_spec.type) at its power tune
  * (car_spec.power): the arcade's tuned set from power 8 on, below that the stock one. */
 void snd_set_car(unsigned type, int power);
-/* Game thread, once per frame: turn the car state into voice parameters. */
+/* Game thread, once per frame: consume latched CInfoSEMc one-shots and update voices. */
 void snd_update(car_state *car, const car_input *in, float dt);
 /* Front-end sounds from the arcade's system_se (SND_START: gamestart.wav, SE 0x3f that
  * clPlayCheckThread plays when the player starts from the attract), and the time attack's:

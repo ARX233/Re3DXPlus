@@ -54,6 +54,7 @@ static void use_prog(void) {
 }
 
 void anm_view(float edge) { A.edge = edge; }
+float anm_edge(void) { return A.edge; }
 
 int anm_wide_drawn(void) { return A.edge > 0.0f && A.wide_clock == A.clock + 1; }
 
@@ -343,6 +344,12 @@ static GLuint texture(int i) {
                GL_UNSIGNED_BYTE, px);
   free(px);
   return A.tex[i];
+}
+
+unsigned int anm_sprite_texture(int sprite) {
+  if (sprite < 0 || (uint32_t)sprite >= A.nsprites || !A.tex || !A.used ||
+      !A.size || !A.offset || !A.zsize || !A.ids || !A.cols || !glGetString(GL_VERSION)) return 0;
+  return texture(sprite);
 }
 
 void anm_trim(void) {

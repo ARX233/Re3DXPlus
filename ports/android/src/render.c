@@ -14,6 +14,8 @@
 /* Implemented by the Vulkan GL adapter; capability does not change the user setting. */
 extern int vkgl_ssao_depth_supported(int w, int h);
 extern int vkgl_program_usable(GLuint id);
+extern int vkgl_error_pending(void);
+extern uint64_t vkgl_error_epoch(void);
 #endif
 #ifdef WMMT_EGL
 #include <EGL/egl.h>
@@ -226,6 +228,12 @@ typedef struct {
 static float frame_k;
 static int frame_wet; /* the wet road takes the last frame too (render_hq_options) */
 static int frame_env; /* lit_init: car.cg with the frame's reflection */
+/* A frame was recorded into blur.tex since its last allocation/reset. */
+static int frame_history_valid;
+#ifdef WMMT_VK
+static uint64_t frame_start_epoch, frame_history_epoch;
+static int frame_recording_trusted;
+#endif
 /* by WPK_LIT_* * 2 + alpha-tested (car.cg's output is opaque: its pair is the same program) */
 static lit_prog lit_progs[2 * WPK_LIT_PROGS];
 /* the overhead map's texture unit and 1 / tan of its half angle (render_overhead) */
@@ -340,6 +348,18 @@ typedef struct {
 } scene_prog;
 static scene_prog progs[2], gloss_progs[2];
 static GLuint white_tex;
+/* The shader samples uFrame even at frame_k==0: always supply a safe texture. */
+static void frame_sampler(GLuint tex) {
+  GLint active;
+  glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+  glActiveTexture(GL_TEXTURE0 + FRAME_UNIT);
+  glBindTexture(GL_TEXTURE_2D, tex);
+  glActiveTexture((GLenum)active);
+}
+static void frame_sampler_off(void) {
+  frame_k = 0.0f; frame_wet = 0;
+  frame_sampler(white_tex);
+}
 
 #ifdef WMMT_EGL
 PFNGLGENVERTEXARRAYSOESPROC wmmt_glGenVertexArraysOES;
@@ -367,6 +387,30 @@ typedef struct {
 
 /* a buffer pool's vertices at most: its indices stay 16-bit */
 #define POOL_VERTS 65536u
+
+/* Shared by normal and shadow drawing; subtraction avoids first+n overflow. */
+static int wpk_chunk_valid(const wpk_chunk *ch, uint32_t n_batch) {
+  return ch->first <= n_batch && ch->n <= n_batch - ch->first;
+}
+
+/* File ranges are half-open; an empty range is valid through EOF. */
+static int wpk_range_valid(uint64_t size, uint64_t off, uint64_t length) {
+  return off <= size && length <= size - off;
+}
+
+/* GL buffer sizes and our pool counters must both represent the whole index buffer. */
+static int wpk_index_buffer_valid(uint32_t bytes, uint32_t count) {
+  uint64_t total = (uint64_t)bytes + (uint64_t)count * 2u;
+  return total <= UINT32_MAX && total <= PTRDIFF_MAX;
+}
+
+/* Validate before changing indices or sending any part of this batch to GL. */
+static int wpk_indices_valid(const uint16_t *idx, uint32_t count, uint32_t vertices, uint32_t base) {
+  if (vertices > POOL_VERTS || base > POOL_VERTS || vertices > POOL_VERTS - base) return 0;
+  for (uint32_t i = 0; i < count; ++i)
+    if (idx[i] >= vertices || (uint32_t)idx[i] >= POOL_VERTS - base) return 0;
+  return 1;
+}
 
 GLuint gl_compile_program(const char *vs, const char *fs, const char **attribs, int n_attribs) {
 #ifdef WMMT_DUMP_PROGS
@@ -522,6 +566,8 @@ int render_init(void) {
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  frame_history_valid = 0;
+  frame_sampler_off();
   return 0;
 }
 
@@ -746,6 +792,14 @@ int wpk_open(wpk_scene *s, const char *path) {
   s->n_tex = h.n_tex;
   s->n_chunk = h.n_chunk;
   s->n_batch = h.n_batch;
+  size_t chunk_rec = v2 ? 36 : 32;
+  if ((uint64_t)h.n_tex * sizeof(wpk_tex) > SIZE_MAX ||
+      (uint64_t)h.n_batch * s->rec_size > SIZE_MAX ||
+      (uint64_t)h.n_chunk * chunk_rec > SIZE_MAX) {
+    fprintf(stderr, "WPK: table size exceeds host limits\n");
+    wpk_free(s);
+    return -1;
+  }
   s->textures = calloc(h.n_tex ? h.n_tex : 1, sizeof(uint32_t));
   s->loaded = calloc(h.n_tex ? h.n_tex : 1, sizeof(uint32_t));
   s->chunks = calloc(h.n_chunk ? h.n_chunk : 1, sizeof(wpk_chunk));
@@ -759,9 +813,10 @@ int wpk_open(wpk_scene *s, const char *path) {
   s->paints = calloc(h.n_tex ? h.n_tex : 1, sizeof(wpk_paint_swap));
   s->tex_tbl = malloc((h.n_tex ? h.n_tex : 1) * sizeof(wpk_tex));
   s->batch_tbl = malloc((h.n_batch ? h.n_batch : 1) * (size_t)s->rec_size);
-  size_t chunk_rec = v2 ? 36 : 32;
   char *chunk_tbl = malloc((h.n_chunk ? h.n_chunk : 1) * chunk_rec);
-  if (!s->tex_tbl || !s->batch_tbl || !chunk_tbl || read_at(fd, s->tex_tbl, h.n_tex * sizeof(wpk_tex), h.tex_off) ||
+  if (!s->path || !s->textures || !s->loaded || !s->chunks || !s->batches || !s->warm ||
+      !s->tex_alpha || !s->tex_wet || !s->tex_warm || !s->is_paint || !s->paints ||
+      !s->tex_tbl || !s->batch_tbl || !chunk_tbl || read_at(fd, s->tex_tbl, h.n_tex * sizeof(wpk_tex), h.tex_off) ||
       read_at(fd, s->batch_tbl, h.n_batch * (size_t)s->rec_size, h.batch_off) ||
       read_at(fd, chunk_tbl, h.n_chunk * chunk_rec, h.chunk_off)) {
     free(chunk_tbl);
@@ -787,21 +842,43 @@ int wpk_open(wpk_scene *s, const char *path) {
     wpk_free(s);
     return -1;
   }
+  struct stat mesh_stat;
+  if (fstat(fd, &mesh_stat) != 0 || mesh_stat.st_size < 0) {
+    fprintf(stderr, "WPK: cannot determine mesh file size\n");
+    wpk_free(s);
+    return -1;
+  }
   uint32_t verts = 0;
   int pool_gloss = 0;
   for (uint32_t i = 0; i < h.n_batch; ++i) {
     const wpk_batch_rec *r = (const wpk_batch_rec *)((const char *)s->batch_tbl + (size_t)i * s->rec_size);
     int gloss = s->gloss_noff && s->gloss_noff[i];
-    if (!s->n_pools || verts + r->vtx_count > POOL_VERTS || gloss != pool_gloss) {
+    if (!wpk_range_valid((uint64_t)mesh_stat.st_size, r->vtx_off, (uint64_t)r->vtx_count * s->stride) ||
+        !wpk_range_valid((uint64_t)mesh_stat.st_size, r->idx_off, (uint64_t)r->idx_count * 2u)) {
+      fprintf(stderr, "WPK: batch %u has invalid file ranges\n", i);
+      wpk_free(s);
+      return -1;
+    }
+    if (r->vtx_count > POOL_VERTS) {
+      fprintf(stderr, "WPK: batch %u exceeds vertex limit\n", i);
+      wpk_free(s);
+      return -1;
+    }
+    if (!s->n_pools || r->vtx_count > POOL_VERTS - verts || gloss != pool_gloss) {
       s->n_pools++;
       verts = 0;
       pool_gloss = gloss;
     }
     wpk_pool *pl = &s->pools[s->n_pools - 1];
+    if (!wpk_index_buffer_valid(pl->ibytes, r->idx_count)) {
+      fprintf(stderr, "WPK: batch %u exceeds index buffer limit\n", i);
+      wpk_free(s);
+      return -1;
+    }
     s->batches[i].pool = s->n_pools - 1;
     pl->vbytes += r->vtx_count * s->stride;
-    pl->ibytes += r->idx_count * 2;
-    if (gloss) pl->nbytes += r->vtx_count * 8;
+    pl->ibytes += r->idx_count * 2u;
+    if (gloss) pl->nbytes += r->vtx_count * 8u;
     verts += r->vtx_count;
   }
 
@@ -1088,12 +1165,50 @@ int wpk_upload(wpk_scene *s, size_t budget) {
     wpk_batch *b = &s->batches[s->next_batch];
     b->tex = r->tex;
     b->flags = r->flags;
-    b->count = r->idx_count;
+    b->count = 0; /* published only after all index uploads succeed */
     b->cutout = r->tex != 0xFFFF && r->tex < s->n_tex && s->tex_alpha[r->tex];
-    size_t vbytes = (size_t)r->vtx_count * stride, ibytes = (size_t)r->idx_count * 2;
-    uint8_t *v = scratch(s, vbytes > ibytes ? vbytes : ibytes);
-    if (!v || read_at(s->fd, v, vbytes, r->vtx_off) != 0) {
-      fprintf(stderr, "%s: batch %u unreadable\n", s->path, s->next_batch);
+    wpk_pool *pl = &s->pools[b->pool];
+    uint32_t base = pl->vfill / stride;
+    if (!wpk_indices_valid(NULL, 0, r->vtx_count, base) ||
+        (uint64_t)r->idx_count * 2u > SIZE_MAX || (uint64_t)r->vtx_count * stride > SIZE_MAX) {
+      fprintf(stderr, "WPK: batch %u exceeds mesh limits\n", s->next_batch);
+      done++;
+      continue;
+    }
+    size_t vbytes = (size_t)r->vtx_count * stride, ibytes = (size_t)r->idx_count * 2u;
+    struct stat st;
+    if (fstat(s->fd, &st) != 0 || st.st_size < 0 ||
+        !wpk_range_valid((uint64_t)st.st_size, r->vtx_off, vbytes) ||
+        !wpk_range_valid((uint64_t)st.st_size, r->idx_off, ibytes)) {
+      fprintf(stderr, "WPK: batch %u has invalid file ranges\n", s->next_batch);
+      done++;
+      continue;
+    }
+    /* Scan index data in bounded chunks, even for a very large valid file. */
+    enum { INDEX_CHUNK = 65536 };
+    size_t index_scratch = ibytes < INDEX_CHUNK ? ibytes : INDEX_CHUNK;
+    if (index_scratch > SIZE_MAX - vbytes) {
+      fprintf(stderr, "WPK: batch %u exceeds scratch limit\n", s->next_batch);
+      done++;
+      continue;
+    }
+    size_t scratch_bytes = vbytes + index_scratch;
+    uint8_t *v = scratch(s, scratch_bytes ? scratch_bytes : 1);
+    uint16_t *idx = v ? (uint16_t *)(void *)(v + vbytes) : NULL;
+    int indices_ok = v != NULL;
+    for (size_t at = 0; indices_ok && at < ibytes;) {
+      size_t n = ibytes - at < INDEX_CHUNK ? ibytes - at : INDEX_CHUNK;
+      if (read_at(s->fd, idx, n, (off_t)((uint64_t)r->idx_off + at)) != 0 ||
+          !wpk_indices_valid(idx, (uint32_t)(n / 2u), r->vtx_count, base)) indices_ok = 0;
+      at += n;
+    }
+    if (!indices_ok || !wpk_indices_valid(idx, 0, r->vtx_count, base)) {
+      fprintf(stderr, "WPK: batch %u has unreadable or invalid indices\n", s->next_batch);
+      done++;
+      continue;
+    }
+    if (read_at(s->fd, v, vbytes, r->vtx_off) != 0) {
+      fprintf(stderr, "WPK: batch %u has unreadable vertices\n", s->next_batch);
       b->count = 0;
       done++;
       continue;
@@ -1119,7 +1234,6 @@ int wpk_upload(wpk_scene *s, size_t budget) {
       b->power = (float)m[2] / 10000.0f;
       if (b->prog == WPK_LIT_CAR) b->cutout = 0; /* car.cg writes alpha 1 */
     }
-    wpk_pool *pl = &s->pools[b->pool];
     if (!pl->vbo) {
       glGenBuffers(1, &pl->vbo);
       glBindBuffer(GL_ARRAY_BUFFER, pl->vbo);
@@ -1128,7 +1242,6 @@ int wpk_upload(wpk_scene *s, size_t budget) {
       glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, pl->ibo);
       glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)pl->ibytes, NULL, GL_STATIC_DRAW);
     }
-    uint32_t base = pl->vfill / stride;
     glBindBuffer(GL_ARRAY_BUFFER, pl->vbo);
     glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)pl->vfill, (GLsizeiptr)vbytes, v);
     pl->vfill += (uint32_t)vbytes;
@@ -1147,20 +1260,29 @@ int wpk_upload(wpk_scene *s, size_t budget) {
       pl->nfill += (uint32_t)nb;
       done += nb;
     }
-    if (read_at(s->fd, v, ibytes, r->idx_off) != 0) {
-      fprintf(stderr, "%s: batch %u unreadable\n", s->path, s->next_batch);
-      b->count = 0;
-      done++;
-      continue;
-    }
-    /* the batch's indices made the pool's */
-    uint16_t *idx = (uint16_t *)v;
-    for (uint32_t k = 0; k < r->idx_count; ++k) idx[k] = (uint16_t)(idx[k] + base);
+    /* Re-read and validate each chunk before upload; a failed or changed file leaves
+     * count zero, so partially written index bytes cannot be drawn. */
     b->ioff = pl->ifill;
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, pl->ibo);
-    glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, (GLintptr)pl->ifill, (GLsizeiptr)ibytes, v);
-    pl->ifill += (uint32_t)ibytes;
-    done += vbytes + ibytes;
+    for (size_t at = 0; at < ibytes;) {
+      size_t n = ibytes - at < INDEX_CHUNK ? ibytes - at : INDEX_CHUNK;
+      if (read_at(s->fd, idx, n, (off_t)((uint64_t)r->idx_off + at)) != 0 ||
+          !wpk_indices_valid(idx, (uint32_t)(n / 2u), r->vtx_count, base)) {
+        indices_ok = 0;
+        break;
+      }
+      for (size_t k = 0; k < n / 2u; ++k) idx[k] = (uint16_t)(idx[k] + base);
+      glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, (GLintptr)(pl->ifill + at), (GLsizeiptr)n, idx);
+      at += n;
+    }
+    if (indices_ok) {
+      pl->ifill += (uint32_t)ibytes;
+      b->count = r->idx_count;
+    } else {
+      fprintf(stderr, "WPK: batch %u indices changed or became unreadable\n", s->next_batch);
+    }
+    if (ibytes > SIZE_MAX - vbytes || vbytes + ibytes > SIZE_MAX - done) done = SIZE_MAX;
+    else done += vbytes + ibytes;
   }
   if (s->next_cube < s->n_cube || s->next_tex < s->n_tex || s->next_batch < s->n_batch) return 0;
   /* everything (but the paints left for later) now lives in GL */
@@ -1251,8 +1373,8 @@ static void pool_free(wpk_pool *pl) {
 
 void wpk_free(wpk_scene *s) {
   for (uint32_t i = 0; s->pools && i < s->n_pools; ++i) pool_free(&s->pools[i]);
-  for (uint32_t i = 0; i < s->n_tex; ++i)
-    if (s->loaded && s->loaded[i]) glDeleteTextures(1, &s->loaded[i]);
+  for (uint32_t i = 0; s->loaded && i < s->n_tex; ++i)
+    if (s->loaded[i]) glDeleteTextures(1, &s->loaded[i]);
   for (uint32_t i = 0; s->cubes && i < s->n_cube; ++i)
     if (s->cubes[i]) glDeleteTextures(1, &s->cubes[i]);
   free(s->cubes);
@@ -1542,6 +1664,8 @@ static GLuint hq_fbo(GLuint tex) {
 }
 
 static void hq_free(void) {
+  frame_history_valid = 0;
+  frame_sampler_off();
   if (hq.ms_fbo) glDeleteFramebuffers(1, &hq.ms_fbo);
   if (hq.ms_color) glDeleteRenderbuffers(1, &hq.ms_color);
   if (hq.ms_depth) glDeleteRenderbuffers(1, &hq.ms_depth);
@@ -1719,6 +1843,8 @@ static int msrt_off;
 void render_hq_blits(void) { msrt_off = 1; }
 
 int render_hq(int samples, float bloom) {
+  frame_history_valid = 0;
+  frame_sampler_off();
   hq.on = 0;
   if (samples <= 0) return 0;
 #ifdef WMMT_EGL
@@ -1941,7 +2067,12 @@ static void hq_pass(GLuint prog, GLuint fbo, int w, int h, GLuint tex) {
 }
 
 /* the frame resolved into blur.tex, and the bloom's levels from it, the result in tex[0] */
-static void hq_resolve_bloom(void) {
+static int hq_resolve_bloom(void) {
+#ifdef WMMT_VK
+  int history_ok = !vkgl_error_pending();
+#else
+  int history_ok = 1;
+#endif
   if (!hq_said) {
     static const char *names[3] = { "R11G11B10F", "RGBA16F", "RGBA8" };
     fprintf(stderr, "render_hq: %dx%d in %s\n", blur.w, blur.h, names[hq.fmt]);
@@ -1958,6 +2089,9 @@ static void hq_resolve_bloom(void) {
     glBindFramebuffer(GL_READ_FRAMEBUFFER_, hq.ms_fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER_, blur.fbo);
     hq.blit(0, 0, blur.w, blur.h, 0, 0, blur.w, blur.h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+#ifdef WMMT_VK
+    if (vkgl_error_pending()) history_ok = 0;
+#endif
   }
   if (ao && !direct) {
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER_, hq.z_fbo);
@@ -2011,7 +2145,7 @@ static void hq_resolve_bloom(void) {
 #endif
   }
   hq.ao_on = ao;
-  if (hq.bloom <= 0.0f) return;
+  if (hq.bloom <= 0.0f) return history_ok;
   /* down: the bright pass into the half size, then each level a half of the one above */
   for (int i = 0; i < HQ_LEVELS; ++i) {
     int src_w = i ? hq.w[i - 1] : blur.w, src_h = i ? hq.h[i - 1] : blur.h;
@@ -2034,6 +2168,7 @@ static void hq_resolve_bloom(void) {
   }
   glDisable(GL_BLEND);
   glBlendFunc((GLenum)bsrc, (GLenum)bdst);
+  return history_ok;
 }
 
 static int sharp_deep;
@@ -2042,7 +2177,8 @@ void render_sharpen(float sharp, int deep) {
   sharp_deep = deep || sharp > 0.0f;
 }
 
-int render_blur_begin(float amount, int w, int h) {
+static int render_blur_begin_inner(float amount, int w, int h) {
+  frame_sampler_off();
   if (amount <= 0.0f && blur.sharp <= 0.0f && !hq.on) return 0;
   blur.out_w = w, blur.out_h = h;
   if (hq.on && hq.scale < 1.0f) { /* (even sizes: the half size ones exact) */
@@ -2051,6 +2187,7 @@ int render_blur_begin(float amount, int w, int h) {
   }
   int deep = sharp_deep || hq.on ? 1 + hq.on : 0; /* 2: render_hq's format (HQ_FORMATS) */
   if (blur.w != w || blur.h != h || (blur.w > 0 && blur.deep != deep)) {
+    frame_history_valid = 0;
     if (blur.fbo) {
       glDeleteFramebuffers(1, &blur.fbo);
       glDeleteTextures(1, &blur.tex);
@@ -2088,18 +2225,19 @@ int render_blur_begin(float amount, int w, int h) {
       glDeleteTextures(1, &blur.tex);
       glDeleteRenderbuffers(1, &blur.depth);
       blur.fbo = blur.tex = blur.depth = 0;
-      return render_blur_begin(amount, w, h);
+      return render_blur_begin_inner(amount, blur.out_w, blur.out_h);
     }
     if (!ok) {
       fprintf(stderr, "radial blur: no %dx%d framebuffer\n", w, h);
       blur.w = blur.h = -1; /* do not try again */
+      frame_sampler_off();
       return 0;
     }
     blur.w = w;
     blur.h = h;
     blur.deep = deep;
   }
-  if (blur.w <= 0) return 0;
+  if (blur.w <= 0) { frame_sampler_off(); return 0; }
   glGetIntegerv(GL_FRAMEBUFFER_BINDING, &blur.screen);
 #ifdef WMMT_VK
   hq.single_frame = 0;
@@ -2123,14 +2261,36 @@ int render_blur_begin(float amount, int w, int h) {
   glBindFramebuffer(GL_FRAMEBUFFER, !hq.on ? blur.fbo : hq.msrt ? hq.rt_fbo : hq.ms_fbo);
 #endif
   blur.amount = amount > 1.0f ? 1.0f : amount < 0.0f ? 0.0f : amount;
-  if (hq.on && frame_env && HQ_LEVEL[hq.level].env && (hq.opt_paint || hq.opt_wet)) { /* the last frame for the paint and the wet road */
-    glActiveTexture(GL_TEXTURE0 + FRAME_UNIT);
-    glBindTexture(GL_TEXTURE_2D, blur.tex);
-    glActiveTexture(GL_TEXTURE0);
+  /* Rebind only a completed earlier frame, never the attached scene texture. */
+  GLuint scene_tex = 0;
+#ifdef WMMT_VK
+  if (hq.single_frame) scene_tex = hq.rt_tex;
+#endif
+  if (hq.msrt) scene_tex = hq.rt_tex;
+#ifdef WMMT_VK
+  if (vkgl_error_pending() || vkgl_error_epoch() == UINT64_MAX || vkgl_error_epoch() != frame_start_epoch)
+    frame_recording_trusted = frame_history_valid = 0;
+#endif
+  if (hq.on && frame_env && frame_history_valid && blur.tex && blur.tex != scene_tex &&
+      HQ_LEVEL[hq.level].env && (hq.opt_paint || hq.opt_wet)) {
+    frame_sampler(blur.tex);
     frame_k = hq.opt_paint ? 0.9f : 0.0f;
     frame_wet = hq.opt_wet;
+  } else {
+    /* The allocation path may have rebound unit 5 if it was previously active. */
+    frame_sampler_off();
   }
   return 1;
+}
+
+int render_blur_begin(float amount, int w, int h) {
+#ifdef WMMT_VK
+  frame_start_epoch = vkgl_error_epoch();
+  frame_recording_trusted = frame_start_epoch != UINT64_MAX && !vkgl_error_pending();
+  if (frame_history_valid && (!frame_recording_trusted || frame_history_epoch != frame_start_epoch))
+    frame_history_valid = 0;
+#endif
+  return render_blur_begin_inner(amount, w, h);
 }
 
 void render_blur_size(int *w, int *h) {
@@ -2138,6 +2298,12 @@ void render_blur_size(int *w, int *h) {
 }
 
 void render_blur_end(void) {
+  int history_ok = 1;
+#ifdef WMMT_VK
+  if (!frame_recording_trusted || vkgl_error_pending() || vkgl_error_epoch() == UINT64_MAX ||
+      vkgl_error_epoch() != frame_start_epoch) history_ok = 0;
+#endif
+  frame_sampler_off();
 #ifdef __APPLE__
 #ifdef WMMT_VK
   if (!hq.single_frame)
@@ -2155,6 +2321,7 @@ void render_blur_end(void) {
     if (error != GL_NO_ERROR) {
       /* Preserve the colour already drawn, but do not consume suspect depth. */
       hq.ssao_ok = hq.single_ready = 0;
+      history_ok = 0;
       fprintf(stderr, "render_ssao: scene GL error 0x%x; returning to MSAA\n", error);
     }
   }
@@ -2182,7 +2349,16 @@ void render_blur_end(void) {
     hq.single_fbo[1] = sf;
 #endif
   }
-  if (hq.on) hq_resolve_bloom();
+  if (hq.on && !hq_resolve_bloom()) history_ok = 0;
+#ifdef WMMT_VK
+  if (vkgl_error_pending() || vkgl_error_epoch() == UINT64_MAX || vkgl_error_epoch() != frame_start_epoch)
+    history_ok = 0;
+#endif
+  /* Recording is not a proof of asynchronous GPU completion. */
+  frame_history_valid = hq.on && history_ok;
+#ifdef WMMT_VK
+  if (frame_history_valid) frame_history_epoch = vkgl_error_epoch();
+#endif
   hq.view_set = 0; /* each frame's own (the menus' 3D has none) */
   glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)blur.screen);
   glViewport(0, 0, blur.out_w, blur.out_h);
@@ -2297,6 +2473,65 @@ void render_sprites(const mat4 *proj, const render_vertex *v, int n_quads, uint3
 void render_sprites_by_colour(const mat4 *proj, const render_vertex *v, int n_quads, uint32_t tex, render_params *p) {
   sprites(proj, v, n_quads, tex, p, GL_SRC_COLOR);
 }
+
+#ifdef __ANDROID__
+/* clTireTrack::draw: SRC_ALPHA/ONE_MINUS_SRC_ALPHA, RGB writes only,
+ * depth-tested with depth writes off, texture clamped across and repeated
+ * along the track. The caller normalizes the blend/cull/depth baseline. */
+void render_tire_tracks(const mat4 *vp, const render_vertex *v, int n_quads, uint32_t tex, render_params *p) {
+  static uint16_t idx[6 * RENDER_MAX_SPRITES];
+  if (!vp || !v || !p || !tex || n_quads <= 0) return;
+  if (n_quads > RENDER_MAX_SPRITES) n_quads = RENDER_MAX_SPRITES;
+  if (!idx[1])
+    for (int i = 0; i < RENDER_MAX_SPRITES; ++i) {
+      uint16_t b = (uint16_t)(4 * i), *q = idx + 6 * i;
+      q[0] = b; q[1] = b + 1; q[2] = b + 2; q[3] = b; q[4] = b + 2; q[5] = b + 3;
+    }
+  GLboolean mask[4], depth_write;
+  glGetBooleanv(GL_COLOR_WRITEMASK, mask);
+  glGetBooleanv(GL_DEPTH_WRITEMASK, &depth_write);
+  const scene_prog *pr = &progs[0];
+  glUseProgram(pr->id);
+  glUniformMatrix4fv(pr->mvp, 1, GL_FALSE, vp->m);
+  glUniform3f(pr->eye, 0, 0, 0);
+  glUniform2f(pr->fog, 1e9f, 1e8f);
+  glUniform2f(pr->uv_off, 0, 0);
+  glUniform3f(pr->grade, 1, 1, 1);
+  glUniform1i(pr->tex, 0);
+  if (pr->wet >= 0) glUniform1f(pr->wet, 0);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, tex);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+  glEnable(GL_DEPTH_TEST);
+  glDepthMask(GL_FALSE);
+  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
+  glDisable(GL_CULL_FACE);
+  glEnable(GL_BLEND);
+  glBlendEquation(GL_FUNC_ADD);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+  glEnableVertexAttribArray(0);
+  glEnableVertexAttribArray(1);
+  glEnableVertexAttribArray(2);
+  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof *v, v->pos);
+  glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof *v, v->uv);
+  glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof *v, v->rgba);
+  glDrawElements(GL_TRIANGLES, (GLsizei)n_quads * 6, GL_UNSIGNED_SHORT, idx);
+  /* Do not leak this texture into later passes that omit an explicit bind. */
+  glBindTexture(GL_TEXTURE_2D, white_tex);
+  glColorMask(mask[0], mask[1], mask[2], mask[3]);
+  glDepthMask(depth_write);
+  glDisable(GL_BLEND);
+  glEnable(GL_CULL_FACE);
+  glUniform2f(pr->fog, p->fog_far, p->fog_near);
+  if (enhance_on) { float grade[3]; enhance_grade(p, 0, grade); glUniform3fv(pr->grade, 1, grade); }
+  else if (p->grade[0] > 0.0f) glUniform3fv(pr->grade, 1, p->grade);
+  ++p->draws;
+  p->triangles += 2 * n_quads;
+}
+#endif
 
 static float box_distance(const float *lo, const float *hi, const float *p) {
   float d2 = 0;
@@ -2481,7 +2716,7 @@ static void wpk_draw_internal(const wpk_scene *s, const mat4 *view_proj, const m
   uint32_t gloss_tex = 0, gloss_cube = 0;
   for (uint32_t c = 0; c < s->n_chunk; ++c) {
     const wpk_chunk *ch = &s->chunks[c];
-    if (ch->first > s->n_batch || ch->n > s->n_batch - ch->first) continue;
+    if (!wpk_chunk_valid(ch, s->n_batch)) continue;
     if (limited && ch->group != group) continue;
     float range;
     int wheel = limited ? -1 : ch->group >= WPK_WHEEL && ch->group < WPK_WHEEL + 4 ? (int)(ch->group - WPK_WHEEL) : -1;
@@ -2574,6 +2809,7 @@ static void wpk_draw_internal(const wpk_scene *s, const mat4 *view_proj, const m
     }
     for (uint32_t i = ch->first; i < ch->first + ch->n; ++i) {
       wpk_batch *b = &s->batches[i];
+      if (!b->count) continue;
       int blend = b->flags & WPK_BLEND_MASK;
       int kind = blend ? WPK_BLEND : b->cutout && !s->solid ? WPK_CUTOUT : WPK_OPAQUE;
       if (kind != pass) continue;
@@ -2796,6 +3032,7 @@ int render_overhead(const wpk_scene *const *s, int n, const mat4 *car, render_pa
     if (!sc || !sc->n_batch || sc->lit) continue;
     for (uint32_t c = 0; c < sc->n_chunk; ++c) {
       const wpk_chunk *ch = &sc->chunks[c];
+      if (!wpk_chunk_valid(ch, sc->n_batch)) continue;
       if (ch->group >= WPK_GROUPS) {
         uint32_t obj = ch->group - WPK_GROUPS;
         if (!p->object_visible || p->n_objects <= 0 || obj >= (uint32_t)p->n_objects || !p->object_visible[obj]) continue;
@@ -2949,9 +3186,10 @@ static void draw_volume(const wpk_scene *s, const mat4 *mvp) {
   glUniformMatrix4fv(shadow_mvp, 1, GL_FALSE, mvp->m);
   for (uint32_t c = 0; c < s->n_chunk; ++c) {
     const wpk_chunk *ch = &s->chunks[c];
-    if (ch->group != WPK_SHADOW || box_outside(mvp, ch->lo, ch->hi)) continue;
+    if (ch->group != WPK_SHADOW || !wpk_chunk_valid(ch, s->n_batch) || box_outside(mvp, ch->lo, ch->hi)) continue;
     for (uint32_t i = ch->first; i < ch->first + ch->n; ++i) {
       const wpk_batch *b = &s->batches[i];
+      if (!b->count) continue; /* not uploaded yet, or rejected: do not cache an empty VAO */
       bind_batch(s, b, &bound);
       glDrawElements(GL_TRIANGLES, (GLsizei)b->count, GL_UNSIGNED_SHORT, (const void *)(uintptr_t)b->ioff);
     }
@@ -3095,11 +3333,12 @@ static int warm_batches(wpk_scene *s, const float *eye_local, float margin, int 
   glScissor(0, 0, 1, 1);
   while (warmed < budget) {
     /* the next cold chunk (wpk_draw may have drawn the one under way meanwhile) */
-    if (s->warm_chunk >= 0 && s->warm[s->warm_chunk]) s->warm_chunk = -1;
+    if (s->warm_chunk >= 0 && ((uint32_t)s->warm_chunk >= s->n_chunk || s->warm[s->warm_chunk])) s->warm_chunk = -1;
     if (s->warm_chunk < 0) {
       float best = 1e30f;
       for (uint32_t c = 0; c < s->n_chunk; ++c) {
         const wpk_chunk *ch = &s->chunks[c];
+        if (!wpk_chunk_valid(ch, s->n_batch)) { s->warm[c] = 1; continue; }
         if (s->warm[c] || (p && !chunk_in_reach(ch, eye_local, margin, p))) continue;
         float d = eye_local ? box_distance(ch->lo, ch->hi, eye_local) : 0;
         if (d >= best) continue;
@@ -3111,10 +3350,19 @@ static int warm_batches(wpk_scene *s, const float *eye_local, float margin, int 
     }
     if (s->warm_chunk < 0) break;
     const wpk_chunk *ch = &s->chunks[s->warm_chunk];
+    if (!wpk_chunk_valid(ch, s->n_batch)) {
+      s->warm[s->warm_chunk] = 1;
+      s->warm_chunk = -1;
+      continue;
+    }
+    if (s->warm_batch < ch->first || s->warm_batch > ch->first + ch->n) s->warm_batch = ch->first;
     if (s->warm_batch < ch->first + ch->n) {
       const wpk_batch *b = &s->batches[s->warm_batch++];
-      warm_draw(s, b, b->tex == 0xFFFF ? white_tex : s->textures[b->tex], b->tex);
-      warmed++;
+      if (b->count) {
+        uint32_t t = b->tex < s->n_tex ? b->tex : 0xFFFF;
+        warm_draw(s, b, t == 0xFFFF ? white_tex : s->textures[t], t);
+        warmed++;
+      }
     }
     if (s->warm_batch >= ch->first + ch->n) {
       s->warm[s->warm_chunk] = 1;
@@ -3141,7 +3389,8 @@ int wpk_warm_near(wpk_scene *s, const float *eye, float margin, int budget, cons
 int wpk_cold_near(const wpk_scene *s, const float *eye, float margin, const render_params *p) {
   int cold = 0;
   for (uint32_t c = 0; s->warm && c < s->n_chunk; ++c)
-    cold += !s->warm[c] && (!p || chunk_in_reach(&s->chunks[c], eye, margin, p));
+    cold += !s->warm[c] && wpk_chunk_valid(&s->chunks[c], s->n_batch) &&
+            (!p || chunk_in_reach(&s->chunks[c], eye, margin, p));
   return cold;
 }
 

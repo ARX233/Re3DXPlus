@@ -1,8 +1,8 @@
 """Run production menu.c on macOS with host stubs; no assets or device.
 
 Run: python3 ports/android/tests/test_story_timezone_host.py
-WMMT_GENERATED_ROOT optionally names control-layout-v12, which must contain
-android/project/src and ipad/project/src; generated files are read-only.
+HUD_GENERATED and WMMT_IPAD_GENERATED optionally name the Android and iPad
+generated source directories respectively; generated files are read-only.
 This menu-state test does not exercise app.c persistence or asset loading.
 """
 import os
@@ -14,7 +14,10 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
-GENERATED = Path(os.environ.get("WMMT_GENERATED_ROOT", ROOT.parent / "control-layout-v12"))
+GENERATED = {
+    port: Path(os.environ[key]) if os.environ.get(key) else ROOT / "ports" / port / "src"
+    for port, key in (("android", "HUD_GENERATED"), ("ipad", "WMMT_IPAD_GENERATED"))
+}
 FIXTURE = Path(__file__).with_name("story_timezone_host.c")
 
 class StoryTimezoneHost(unittest.TestCase):
@@ -24,7 +27,7 @@ class StoryTimezoneHost(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="wmmt-story-host-") as tmp:
             for port in ("android", "ipad"):
                 with self.subTest(port=port):
-                    generated = GENERATED / port / "project" / "src"
+                    generated = GENERATED[port]
                     if not (generated / "cardb.h").is_file():
                         self.skipTest(f"generated headers unavailable: {generated}")
                     menu = ROOT / "ports" / port / "src" / "menu.c"

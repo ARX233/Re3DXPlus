@@ -7,6 +7,13 @@
 set -e
 [ "$#" -eq 0 ] || { echo 'No arguments supported; device operations are not provided.' >&2; exit 1; }
 cd "$(dirname "$0")"
+# The 1.31 Android snapshot deliberately keeps app-owned diagnostic logging disabled.
+DEBUG_LOG="${DEBUG_LOG:-0}"
+case "$DEBUG_LOG" in
+  0) DEBUG_FLAGS=""; DEBUG_SRC="" ;;
+  1) echo 'DEBUG_LOG=1 is not supported by this 1.31 Android snapshot' >&2; exit 1 ;;
+  *) echo 'DEBUG_LOG must be 0' >&2; exit 1 ;;
+esac
 : "${ANDROID_HOME:?Set ANDROID_HOME to your Android SDK}"
 : "${JAVA_HOME:?Set JAVA_HOME to your JDK}"
 : "${SIGNING_KEYSTORE:?Set SIGNING_KEYSTORE to your private keystore}"
@@ -50,17 +57,18 @@ if [ ! -f "$OUT/obj/phys_rc.o" ] || [ src/phys/phys_rc.c -nt "$OUT/obj/phys_rc.o
   echo "compiling the arcade physics (takes a minute)..."
   $CC -O2 -fPIC -ffp-contract=off -DRC_FPT=double -w -c src/phys/phys_rc.c -o "$OUT/obj/phys_rc.o"
 fi
-$CC -O2 -fPIC -shared -std=gnu99 -Wall -Wno-unused-function -DRC_FPT=double -DWMMT_EGL $GFX \
+$CC -O2 -fPIC -shared -std=gnu99 -Wall -Wno-unused-function -DRC_FPT=double -DWMMT_EGL $DEBUG_FLAGS $GFX \
   -mcpu=cortex-a73 \
-  src/main_android.c src/app.c src/story_evidence.c src/render.c src/hud.c src/car.c src/collide.c src/sound.c src/anm.c src/menu.c \
+  src/main_android.c src/app.c src/story_evidence.c src/pre_race_tune.c src/junction_ui.c src/junction_barrier.c src/render.c src/hud.c src/car.c src/collide.c src/sound.c src/anm.c src/menu.c \
   src/lights.c src/spark.c src/backfire.c src/backfire_wpk.c src/net.c src/vs_host.c src/title.c src/gk.c \
-  src/phys/rc_runtime.c "$OUT/obj/phys_rc.o" \
+  src/phys/rc_runtime.c $DEBUG_SRC "$OUT/obj/phys_rc.o" \
   -o "$OUT/apk/lib/arm64-v8a/libwmmt.so" \
   -landroid $GFX_LIBS -laaudio -llog -lz -lm -Wl,-z,max-page-size=16384
 
 # the Java side
 "$JAVA_HOME/bin/javac" -source 8 -target 8 -nowarn -classpath "$PLAT/android.jar" -d "$OUT/classes" \
-  android/java/com/wmmt/port/MainActivity.java android/java/com/wmmt/port/CardResources.java
+  android/java/com/wmmt/port/MainActivity.java android/java/com/wmmt/port/CardResources.java android/java/com/wmmt/port/DebugLogStorage.java \
+  android/java/com/wmmt/port/DataManifest.java android/java/com/wmmt/port/DataOverlay.java android/java/com/wmmt/port/DataCoordinator.java
 "$BT/d8" --min-api $API --lib "$PLAT/android.jar" --output "$OUT/apk" $(find "$OUT/classes" -name '*.class')
 
 # the manifest and icon, then the apk, aligned and signed with a key of its own
@@ -123,6 +131,12 @@ if [ -n "${BACKFIRE_WPK:-}" ] || [ -n "${BACKFIRE_BFX:-}" ]; then
 fi
 "$BT/zipalign" -f -P 16 4 "$OUT/base.apk" "$OUT/aligned.apk"
 [ ! -e "$APK_OUT" ] || { echo "Refusing to overwrite existing APK: $APK_OUT" >&2; exit 1; }
-# apksigner prompts interactively for required passwords; never embed them in the script.
-"$BT/apksigner" sign --ks "$SIGNING_KEYSTORE" --out "$APK_OUT" "$OUT/aligned.apk"
+# A private caller may supply both passwords by environment reference; otherwise
+# apksigner prompts interactively. Never embed passwords or print them here.
+if [ "${WMMT_KS_PASS+x}" = x ] || [ "${WMMT_KEY_PASS+x}" = x ]; then
+  [ "${WMMT_KS_PASS+x}" = x ] && [ "${WMMT_KEY_PASS+x}" = x ] || { echo 'Both signing password references are required' >&2; exit 1; }
+  "$BT/apksigner" sign --ks "$SIGNING_KEYSTORE" --ks-pass env:WMMT_KS_PASS --key-pass env:WMMT_KEY_PASS --out "$APK_OUT" "$OUT/aligned.apk"
+else
+  "$BT/apksigner" sign --ks "$SIGNING_KEYSTORE" --out "$APK_OUT" "$OUT/aligned.apk"
+fi
 echo "built $APK_OUT"

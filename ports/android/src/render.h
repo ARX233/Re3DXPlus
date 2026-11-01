@@ -360,5 +360,11 @@ typedef struct {
 void render_sprites(const mat4 *proj, const render_vertex *v, int n_quads, uint32_t tex, render_params *p);
 /* the same added by their own colour (glBlendFunc(GL_SRC_COLOR, GL_ONE): clCarSpotLight's) */
 void render_sprites_by_colour(const mat4 *proj, const render_vertex *v, int n_quads, uint32_t tex, render_params *p);
+#ifdef __ANDROID__
+/* Original tire-track blend/depth/colour-mask state; vertices are world-space,
+ * vp is the view-projection matrix, and tex is the dedicated tirepattern image.
+ * Call after render_blend_pass(0), while depth testing and back-face culling are on. */
+void render_tire_tracks(const mat4 *vp, const render_vertex *v, int n_quads, uint32_t tex, render_params *p);
+#endif
 
 #endif

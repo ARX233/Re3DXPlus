@@ -1,4 +1,7 @@
 #include "rc_runtime.h"
+#ifdef WMMT_DEBUG_LOG
+#include "../debug_log.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,11 +25,17 @@ FILE *rc_trace;
 
 void rc_fail(const char *msg) {
   fprintf(stderr, "rc: %s\n", msg);
+#ifdef WMMT_DEBUG_LOG
+  debug_log_before_abort(0); /* best-effort only; never log arbitrary text */
+#endif
   abort();
 }
 
 void rc_fail_addr(const char *msg, uint32_t a) {
   fprintf(stderr, "rc: %s %#x\n", msg, a);
+#ifdef WMMT_DEBUG_LOG
+  debug_log_before_abort(a); /* emulated address, not a host pointer */
+#endif
   abort();
 }
 

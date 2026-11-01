@@ -9,10 +9,20 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "phys/rc_runtime.h"
 
 void f_89878c4(void); /* yt::CSeq::Init(SConfigPlay const&) */
+/* Some old private physics translations omit End entirely. A weak no-op
+ * definition makes those builds link; capture recognizes this stub and leaves
+ * the old sequence ready. Patched full-root physics overrides it strongly. */
+static int story_carry_end_stub_called;
+__attribute__((weak, noinline)) void f_8986878(void) { story_carry_end_stub_called = 1; }
+/* A legacy unpatched physics translation resolves this weak definition to 0.
+ * The reviewed private bridge supplies the strong marker. Volatile prevents
+ * compile-time folding of this link-time feature check. */
+__attribute__((weak)) const volatile uint32_t rc_story_carry_bridge = 0;
 void f_8983f64(void); /* yt::CSeq::Exec(std::auto_ptr<clGameInput> const&) */
 void f_89a2584(void); /* yt::CElapse::Init */
 void f_89a2548(void); /* yt::CElapse::SetByMul */
@@ -32,6 +42,9 @@ void f_89ba05c(void); /* yt::CMachine::SetFirstPos(SFirstPoint const&, float) */
 void f_8983950(void); /* yt::CSeq::Get2DInfoRace */
 void f_8983874(void); /* yt::CSeq::Get2DInfoMap */
 void f_898380c(void); /* yt::CSeq::Get2DInfoSign */
+/* Requires the expanded guarded physics recompile with these two roots. */
+void f_8982f4c(void); /* Get2DInfoJctSelect: one 16-byte output */
+void f_8983cd8(void); /* GetInfoJctDecideLine: three separate 12-byte outputs */
 void f_898f518(void); /* yt::CSeq::GetInfoGoalLine */
 void f_898f6d4(void); /* yt::CSeq::GetInfoSplitLine */
 void f_8983e5c(void); /* yt::CSeq::GetInfoTenRivalLine */
@@ -165,7 +178,9 @@ static struct {
   int course;
   car_spec spec;
   uint32_t m, gen, gin, gin_ptr, disp, eff, cam, mirror, jct, info_race, info_map, info_sign, lines, ten_line;
+  uint32_t jct_select, jct_decide_line;
   int view;
+  int ta_traffic, se_backfire_on;
   int manual, lever, top_lever; /* lever 0..gears-1, -1 = neutral */
   int traffic_model[CAR_TRAFFIC];
   int has_rival, n_rival;
@@ -181,6 +196,9 @@ static struct {
   unsigned vs_seed;
   car_link_car vs[CAR_LINK_MACHINES - 1];
   car_link_io vs_io;
+  double vs_received[CAR_LINK_MACHINES]; /* monotonic seconds; 0 = no confirmed packet */
+  uint32_t vs_count[CAR_LINK_MACHINES];
+  unsigned char vs_count_valid[CAR_LINK_MACHINES];
   uint32_t info_story, result, first_pt, title_log;
   int ready;
 } P = { .view = CAR_VIEW_BEHIND };
@@ -199,6 +217,205 @@ static uint32_t call(void (*fn)(void), int n, ...) {
   for (int i = 0; i < n; i++) W32(esp + 4 + 4 * i, a[i]);
   fn();
   return eax;
+}
+
+/* Private, in-memory equivalent of the original SCarryover serialization.
+ * The game's 0x7c structure contains four image pointers. Those pointers are
+ * never retained across rc_load_image: only verified unique area IDs are kept.
+ * The bridge callbacks below replace the original file Save/Load entrypoints;
+ * they do not open, create, read or write a carryover file. */
+enum { STORY_CARRY_SIZE = 0x7c, STORY_CARRY_SLOTS = 4, STORY_AREA_COUNT = 75 };
+#define STORY_AREA_TABLE 0x94429a0u
+#define STORY_BRIDGE_MAGIC 0x53544331u
+static struct {
+  uint8_t data[STORY_CARRY_SIZE];
+  int area[STORY_CARRY_SLOTS];
+  car_rival rival[CAR_RIVALS];
+  car_spec player;
+  uint64_t token;
+  uint32_t target_stage;
+  int old_count, old_series, target_series, manual;
+  int valid, armed, capturing, save_calls, initializing, loaded;
+} story_carry;
+
+static int carry_span(uint32_t address, uint32_t length) {
+  return rc_mem && address >= RC_MEM_BASE && length <= RC_MEM_SIZE &&
+         address - RC_MEM_BASE <= RC_MEM_SIZE - length;
+}
+/* The area's static image object supplies +0x20 (length), +0x24 (section
+ * table) and +0x28 (section count) to CSlit::SetFirst/SearchSectionCur.
+ * Reject heap/stack lookalikes and tables outside the immutable image. */
+static int carry_image_span(uint32_t address, uint32_t length) {
+  return rc_mem && address >= RC_IMG_BASE && length <= RC_IMG_END - RC_IMG_BASE &&
+         address - RC_IMG_BASE <= RC_IMG_END - RC_IMG_BASE - length;
+}
+static int carry_area_valid(uint32_t address) {
+  if (!carry_image_span(address, 0x2c)) return 0;
+  uint32_t table = M32(address + 0x24), count = M32(address + 0x28);
+  /* SearchSectionCur indexes 40-byte records and reads +0x28. */
+  if (!count || count > (RC_IMG_END - RC_IMG_BASE - 4u) / 40u) return 0;
+  return carry_image_span(table, count * 40u + 4u);
+}
+static uint32_t carry_word(const uint8_t *p) {
+  uint32_t v; memcpy(&v, p, sizeof v); return v;
+}
+static void carry_put_word(uint8_t *p, uint32_t v) { memcpy(p, &v, sizeof v); }
+static int carry_finite_word(const uint8_t *p) {
+  float v; memcpy(&v, p, sizeof v); return isfinite(v);
+}
+static int carry_unique_rivals(const car_rival *r, int n) {
+  if (!r || n < 1 || n > CAR_RIVALS) return 0;
+  for (int i = 0; i < n; ++i) {
+    if (r[i].character < 0) return 0;
+    for (int j = 0; j < i; ++j)
+      if (r[i].character == r[j].character) return 0;
+  }
+  return 1;
+}
+void car_story_carry_cancel(void) { memset(&story_carry, 0, sizeof story_carry); }
+
+/* Generated code enters these with cdecl return address at esp and this at
+ * esp+4. Emulate its return and AL success without invoking any file API. */
+void rc_story_carry_save(void) {
+  int ok = story_carry.capturing && ++story_carry.save_calls == 1;
+  uint32_t address = 0;
+  if (carry_span(esp, 8)) address = M32(esp + 4); else ok = 0;
+  uint8_t tmp[STORY_CARRY_SIZE];
+  int ids[STORY_CARRY_SLOTS] = { -1, -1, -1, -1 };
+  if (!carry_span(address, STORY_CARRY_SIZE) ||
+      !carry_span(STORY_AREA_TABLE, STORY_AREA_COUNT * 4u)) ok = 0;
+  if (ok) {
+    memcpy(tmp, VA(address), sizeof tmp);
+    if (tmp[0x18] != 1) ok = 0; /* the player is mandatory */
+    for (int k = 0; k < STORY_CARRY_SLOTS && ok; ++k) {
+      unsigned flag = tmp[0x18 + k];
+      if (flag > 1 || (k > story_carry.old_count && flag)) { ok = 0; break; }
+      uint8_t *point = tmp + 0x1c + 0x14 * k;
+      uint32_t old_pointer = carry_word(point + 4);
+      if (flag) {
+        int matches = 0;
+        for (int i = 0; i < STORY_AREA_COUNT; ++i) {
+          uint32_t candidate = M32(STORY_AREA_TABLE + 4u * (uint32_t)i);
+          if (candidate && candidate == old_pointer) { ids[k] = i; ++matches; }
+        }
+        if (matches != 1 || !carry_area_valid(old_pointer)) ok = 0;
+        /* SFirstPoint +0 is an integer word; only +8..+0x10 are
+         * consumed as floating point by the original serializer. */
+        for (int o = 8; o < 0x14 && ok; o += 4)
+          if (!carry_finite_word(point + o)) ok = 0;
+        if (!carry_finite_word(tmp + 0x6c + 4 * k)) ok = 0;
+      }
+      carry_put_word(point + 4, 0); /* discard every old image pointer */
+    }
+    for (int o = 4; o <= 0x10 && ok; o += 4)
+      if (!carry_finite_word(tmp + o)) ok = 0;
+    if (ok) {
+      memcpy(story_carry.data, tmp, sizeof tmp);
+      memcpy(story_carry.area, ids, sizeof ids);
+    }
+  }
+  story_carry.valid = ok;
+  eax = (eax & ~0xffu) | (ok ? 1u : 0u);
+  esp += 4;
+}
+
+static int carry_target_matches(void) {
+  if (!story_carry.valid || !story_carry.armed || !story_carry.token ||
+      !story_carry.initializing || P.vs_on || P.ten_stage || !P.has_rival ||
+      P.n_rival < story_carry.old_count || !carry_unique_rivals(P.rival, P.n_rival) ||
+      P.rival[0].series != story_carry.target_series || P.spec.type != story_carry.player.type ||
+      P.spec.gears != story_carry.player.gears || P.spec.spokes != story_carry.player.spokes ||
+      P.manual != story_carry.manual ||
+      memcmp(P.spec.tyres, story_carry.player.tyres, sizeof P.spec.tyres) != 0 ||
+      carry_word(story_carry.data) != story_carry.target_stage) return 0;
+  for (int k = 0; k < story_carry.old_count; ++k)
+    if (story_carry.rival[k].character != P.rival[k].character ||
+        story_carry.rival[k].type != P.rival[k].type ||
+        story_carry.rival[k].level != P.rival[k].level) return 0;
+  return 1;
+}
+void rc_story_carry_load(void) {
+  uint32_t address = 0;
+  int ok = carry_span(esp, 8);
+  if (ok) address = M32(esp + 4);
+  if (!carry_span(address, STORY_CARRY_SIZE) ||
+      !carry_span(STORY_AREA_TABLE, STORY_AREA_COUNT * 4u) || !carry_target_matches()) ok = 0;
+  uint8_t tmp[STORY_CARRY_SIZE];
+  if (ok) {
+    memcpy(tmp, story_carry.data, sizeof tmp);
+    if (tmp[0x18] != 1) ok = 0;
+    for (int k = 0; k < STORY_CARRY_SLOTS && ok; ++k) {
+      unsigned flag = tmp[0x18 + k];
+      if (flag > 1 || (k > story_carry.old_count && flag)) { ok = 0; break; }
+      if (flag) {
+        int id = story_carry.area[k];
+        if (id < 0 || id >= STORY_AREA_COUNT) { ok = 0; break; }
+        uint32_t pointer = M32(STORY_AREA_TABLE + 4u * (uint32_t)id);
+        int matches = 0;
+        for (int i = 0; i < STORY_AREA_COUNT; ++i)
+          if (pointer && M32(STORY_AREA_TABLE + 4u * (uint32_t)i) == pointer) ++matches;
+        if (matches != 1 || !carry_area_valid(pointer)) { ok = 0; break; }
+        carry_put_word(tmp + 0x20 + 0x14 * k, pointer);
+      }
+    }
+    /* One commit only, after all identity, stage, flag and area checks. */
+    if (ok) memcpy(VA(address), tmp, sizeof tmp);
+  }
+  story_carry.loaded = ok;
+  if (!ok && story_carry.initializing) car_story_carry_cancel();
+  eax = (eax & ~0xffu) | (ok ? 1u : 0u);
+  esp += 4;
+}
+
+int car_story_carry_capture(uint64_t token, int expected_series) {
+  if (!token || story_carry.token || rc_story_carry_bridge != STORY_BRIDGE_MAGIC ||
+      !P.ready || !P.has_rival || P.vs_race || P.vs_on || P.ten_stage ||
+      !carry_span(STATE, 4) || M32(STATE) != 10 ||
+      !carry_unique_rivals(P.rival, P.n_rival) || P.rival[0].series != expected_series) return -1;
+  car_story_carry_cancel();
+  story_carry.token = token;
+  story_carry.old_count = P.n_rival;
+  story_carry.old_series = expected_series;
+  story_carry.player = P.spec;
+  story_carry.manual = P.manual;
+  memcpy(story_carry.rival, P.rival, sizeof story_carry.rival);
+  story_carry.capturing = 1;
+  /* Entering a real End tears down CSeq regardless of Save success. If an
+   * incomplete translation resolves the weak stub, End was not entered. */
+  story_carry_end_stub_called = 0;
+  P.ready = 0;
+  call(f_8986878, 0);
+  story_carry.capturing = 0;
+  if (story_carry_end_stub_called) {
+    P.ready = 1;
+    car_story_carry_cancel();
+    return -1;
+  }
+  if (!story_carry.valid || story_carry.save_calls != 1) {
+    car_story_carry_cancel();
+    return 0;
+  }
+  return 1;
+}
+int car_story_carry_arm(uint64_t token, int target_series) {
+  if (!token || !story_carry.valid || token != story_carry.token || target_series < 0 ||
+      target_series == story_carry.old_series ||
+      (story_carry.armed && target_series != story_carry.target_series)) {
+    car_story_carry_cancel();
+    return 0;
+  }
+  story_carry.armed = 1;
+  story_carry.target_series = target_series;
+  story_carry.loaded = 0;
+  return 1;
+}
+int car_story_carry_loaded(uint64_t token) {
+  return token && token == story_carry.token && story_carry.armed && story_carry.loaded;
+}
+int car_story_carry_finalize(uint64_t token) {
+  if (!car_story_carry_loaded(token)) return 0;
+  car_story_carry_cancel();
+  return 1;
 }
 
 int car_init(const char *data_dir, char *err, int err_len) {
@@ -254,6 +471,8 @@ static void on_hook(uint32_t at) {
   }
 }
 
+void car_set_ta_traffic(int on) { P.ta_traffic = on != 0; }
+
 void car_set_rivals(const car_rival *rivals, int n) {
   P.n_rival = n < 0 ? 0 : n > CAR_RIVALS ? CAR_RIVALS : n;
   P.has_rival = P.n_rival > 0;
@@ -288,6 +507,10 @@ void car_set_ten(int stage, int level, const car_rival *rivals, int n) {
 void f_8992604(void); /* yt::GetBattleRaceField(ERamp) */
 
 void car_set_versus(int pcb, const car_link_car *others, int n, int ramp, float km, unsigned seed, const car_link_io *io) {
+  /* Invalidate observations as soon as a new session is configured. */
+  memset(P.vs_received, 0, sizeof P.vs_received);
+  memset(P.vs_count_valid, 0, sizeof P.vs_count_valid);
+  P.vs_race = 0;
   P.vs_on = n > 0 && io;
   P.vs_pcb = pcb;
   P.vs_n = n < 0 ? 0 : n > CAR_LINK_MACHINES - 1 ? CAR_LINK_MACHINES - 1 : n;
@@ -307,9 +530,51 @@ const char *car_link_ramp_name(int ramp) {
 static void link_receive(void) { if (P.vs_io.receive) P.vs_io.receive(P.vs_io.ctx); }
 static void link_send(void) { if (P.vs_io.send) P.vs_io.send(VA(rc_link_tx), CAR_LINK_PACKET, P.vs_io.ctx); }
 
+/* A conservative port timeout, not an asserted arcade constant. The transport
+ * must call this only for a room/race/PCB/sequence-validated new packet. */
+static double link_now(void) {
+  struct timespec t;
+  if (clock_gettime(CLOCK_MONOTONIC, &t) != 0) return 0;
+  return (double)t.tv_sec + (double)t.tv_nsec / 1000000000.0;
+}
+int car_link_time_fresh(double now, double received) {
+  return isfinite(now) && isfinite(received) && received > 0 && now >= received && now - received <= 1.0;
+}
+void car_link_fresh(int pcb, int active) {
+  if (pcb < 0 || pcb >= CAR_LINK_MACHINES) return;
+  P.vs_received[pcb] = active ? link_now() : 0;
+}
+int car_link_observation_fresh(int pcb, double observed) {
+  return pcb >= 0 && pcb < CAR_LINK_MACHINES && observed == P.vs_received[pcb] &&
+         car_link_time_fresh(link_now(), observed);
+}
+
 void car_link_deliver(int pcb, const unsigned char *packet, int len) {
-  if (!rc_link_rx || pcb < 0 || pcb >= CAR_LINK_MACHINES || len < CAR_LINK_PACKET) return;
-  memcpy(VA(rc_link_rx + LINK_BUF * (uint32_t)pcb), packet, CAR_LINK_PACKET);
+  if (!rc_link_rx || !packet || pcb < 0 || pcb >= CAR_LINK_MACHINES || len < CAR_LINK_PACKET) return;
+  unsigned char *destination = VA(rc_link_rx + LINK_BUF * (uint32_t)pcb);
+  int matched = 0;
+  if (P.ready && pcb != P.vs_pcb)
+    for (int i = 0; i < P.vs_race; ++i) if (P.vs[i].pcb == pcb) matched = 1;
+  if (!matched) {
+    /* Preserve receive semantics even during Init or for an unrelated PCB. */
+    memcpy(destination, packet, CAR_LINK_PACKET);
+    return;
+  }
+  /* Transport calls this for newly delivered, race-validated packets, but WV1
+   * also delivers duplicate frame counts. Do not extend the HUD freshness on
+   * duplicates or old frames. Keep the original packet delivery semantics. */
+  uint32_t count = (uint32_t)packet[0x34] | (uint32_t)packet[0x35] << 8 |
+                   (uint32_t)packet[0x36] << 16 | (uint32_t)packet[0x37] << 24;
+  uint32_t delta = count - P.vs_count[pcb];
+  int newer = !P.vs_count_valid[pcb] || (delta != 0 && delta < 0x80000000u);
+  if (!newer && memcmp(destination, packet, CAR_LINK_PACKET) != 0)
+    P.vs_received[pcb] = 0; /* changed data at an old count is not observable */
+  memcpy(destination, packet, CAR_LINK_PACKET);
+  if (newer) {
+    P.vs_count[pcb] = count;
+    P.vs_count_valid[pcb] = 1;
+    P.vs_received[pcb] = link_now();
+  }
 }
 
 /* clCarDispManager::setupOtherCar: a traffic car comes on the road; its model */
@@ -322,9 +587,19 @@ static int on_other_setup(uint32_t slot, uint32_t type) {
 static void first_frame(car_state *c);
 
 int car_start(car_state *c, int course, int manual, const car_spec *spec) {
+  if (c) car_clear_junction(&c->race);
+  story_carry.loaded = 0;
+  if (story_carry.valid && !story_carry.armed) car_story_carry_cancel();
   /* a fresh arcade memory image per race, like a fresh boot of CSeq::Init */
   P.ready = 0;
-  if (course < 0 || course >= CAR_COURSES || rc_load_image(P.image) != 0) return -1;
+  P.se_backfire_on = 0;
+  memset(P.vs_received, 0, sizeof P.vs_received);
+  memset(P.vs_count_valid, 0, sizeof P.vs_count_valid);
+  P.vs_race = 0;
+  if (course < 0 || course >= CAR_COURSES || rc_load_image(P.image) != 0) {
+    car_story_carry_cancel();
+    return -1;
+  }
   P.course = course;
   P.manual = manual != 0;
   P.spec = spec ? *spec : CAR_SPEC_FD3S;
@@ -333,7 +608,7 @@ int car_start(car_state *c, int course, int manual, const car_spec *spec) {
   rc_reset_heap();
   rc_on_hook = on_hook;
   rc_on_other_setup = on_other_setup;
-  /* Normal time attack: no traffic; the arcade's hidden traffic-button variant is not selected. */
+  /* Time attack traffic is optional; other modes explicitly clear the flag. */
   uint32_t cfg = rc_alloc(0x200);
   W32(cfg + CFG_CAR, P.spec.type);
   W32(cfg + CFG_POWER, (uint32_t)P.spec.power);
@@ -348,8 +623,9 @@ int car_start(car_state *c, int course, int manual, const car_spec *spec) {
     WF(cfg + CFG_GOAL, COURSES[course].dist + 1000.0f * (float)atof(getenv("WMMT_TA_GOAL")));
 #endif
   W32(cfg + CFG_MODE, MODE_TIME_ATTACK);
-  W32(cfg + CFG_TA_TRAFFIC, 0u);
-  if (P.has_rival) { /* the story mode's race against its rivals */
+  W32(cfg + CFG_TA_TRAFFIC, (uint32_t)P.ta_traffic);
+  if (P.has_rival) {
+    W32(cfg + CFG_TA_TRAFFIC, 0u); /* the story mode's race against its rivals */
     W32(cfg + CFG_MODE, MODE_STORY);
     W32(cfg + CFG_LEVEL, (uint32_t)P.rival[0].level);
     W32(cfg + CFG_LOSSES, (uint32_t)P.rival[0].losses);
@@ -414,7 +690,13 @@ int car_start(car_state *c, int course, int manual, const car_spec *spec) {
     fprintf(stderr, "ten stage %d level %d: area %u dist %.0f goal %.0f\n", P.ten_stage, P.ten_level, M32(cfg + CFG_AREA),
             MF(cfg + CFG_DIST), MF(cfg + CFG_GOAL));
   }
+  if (story_carry.valid && story_carry.armed) {
+    story_carry.target_stage = M32(cfg + CFG_STAGE);
+    story_carry.initializing = 1;
+    if (!carry_target_matches()) car_story_carry_cancel();
+  }
   call(f_89878c4, 1, cfg);
+  story_carry.initializing = 0;
   P.vs_race = P.vs_on ? P.vs_n : 0;
   P.vs_on = 0; /* car_set_versus is for this race only */
   call(f_89a2584, 1, fbits(1.0f / 60.0f));
@@ -431,6 +713,8 @@ int car_start(car_state *c, int course, int manual, const car_spec *spec) {
   P.cam = rc_alloc(0x100);
   P.mirror = rc_alloc(0x100);
   P.jct = rc_alloc(8);
+  P.jct_select = rc_alloc(16);
+  P.jct_decide_line = rc_alloc(36);
   P.info_race = rc_alloc(0x40);
   P.info_map = rc_alloc(0x20);
   P.info_sign = rc_alloc(8);
@@ -474,10 +758,20 @@ static void read_body(car_state *c) {
    * memory layout as a GL column-major matrix. Units are already display units. */
   memcpy(c->body, VA(P.disp + 4), sizeof c->body);
   read_tyres(c->tyre, c->tyre_rot);
+#ifdef __ANDROID__
+  /* clCarEffectManager::update (0x85fa7d1): its four trail matrices are
+   * the world-space SInfoCarDisp +0x44..+0x104, not the display-wheel
+   * matrices read by read_tyres. Preserve the original index pairing. */
+  for (int k = 0; k < 4; ++k)
+    memcpy(c->track_matrix[k], VA(P.disp + 0x44 + 0x40u * (uint32_t)k), sizeof c->track_matrix[k]);
+#endif
   c->brake = M8(P.disp + 0x144);
   c->spot = M8(P.disp + 0x146) == 1;
   call(f_89b410c, 2, P.m, P.eff);
   read_effect(&c->effect);
+#ifdef __ANDROID__
+  for (int k = 0; k < 4; ++k) c->track_alpha[k] = MF(P.eff + 0x40 + 4u * (uint32_t)k);
+#endif
   const float *M = c->body;
   c->pos[0] = M[12];
   c->pos[1] = M[13];
@@ -522,6 +816,50 @@ static void read_jct_blocks(car_state *c) {
   for (int i = 0; i < 2; i++) c->jct_block[i] = (int)M32(P.jct + 4 * i);
 }
 
+/* Clear snapshots on teardown; does not mutate the engine's branch choice. */
+void car_clear_junction(car_race *r) {
+  if (!r) return;
+  r->jct_select_valid = r->jct_state = r->jct_left_area = r->jct_right_area = 0;
+  r->jct_distance = 0;
+  r->jct_line_valid = 0;
+  memset(r->jct_line, 0, sizeof r->jct_line);
+}
+
+/* VA checks the start only; check the whole span before touching scratch or
+ * the top-level engine pointers. Nested virtual-call objects remain engine-owned. */
+static int jct_span(uint32_t p, uint32_t n) {
+  return rc_mem && p >= RC_MEM_BASE && n <= RC_MEM_SIZE && p - RC_MEM_BASE <= RC_MEM_SIZE - n;
+}
+static void read_junction(car_race *r) {
+  car_clear_junction(r);
+  if (!P.ready || !jct_span(P.jct_select, 16) || !jct_span(P.jct_decide_line, 36)) return;
+  uint32_t machine = M32(MACHINE_PTR), jct = M32(0x98028f0u);
+  if (!jct_span(machine, 0x974) || (jct && !jct_span(jct, 12))) return;
+  if (jct) {
+    uint32_t table = M32(jct), proc = M32(machine + 0x938u);
+    if (!jct_span(table, 0x14) || !jct_span(proc, 4)) return;
+    uint32_t proc_table = M32(proc);
+    if (!jct_span(proc_table, 0x28)) return;
+  }
+  memset(VA(P.jct_select), 0, 16);
+  memset(VA(P.jct_decide_line), 0, 36);
+  if (call(f_8982f4c, 1, P.jct_select) & 0xffu) {
+    uint32_t state = M32(P.jct_select), left = M32(P.jct_select + 4), right = M32(P.jct_select + 8);
+    float distance = MF(P.jct_select + 12);
+    if (state <= 3 && isfinite(distance) && (state == 0 || (left < 75 && right < 75))) {
+      r->jct_select_valid = 1; r->jct_state = (int)state;
+      r->jct_left_area = (int)left; r->jct_right_area = (int)right;
+      r->jct_distance = distance;
+    }
+  }
+  if (call(f_8983cd8, 3, P.jct_decide_line, P.jct_decide_line + 12, P.jct_decide_line + 24) & 0xffu) {
+    float v[3][3]; memcpy(v, VA(P.jct_decide_line), sizeof v);
+    int valid = 1;
+    for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) valid &= isfinite(v[i][j]);
+    if (valid) { memcpy(r->jct_line, v, sizeof v); r->jct_line_valid = 1; }
+  }
+}
+
 /* The time attack's consoles: S2DInfoRace (+4 time left, +8 time since the start, +0xc mm
  * to the goal) and S2DInfoMap (+0 area, +4 the next, +8 z, +0xc x in display units, +0x10
  * heading), as CSeq hands them to clStandardConsole and clMiniMap; the sections from the
@@ -531,6 +869,7 @@ static void read_jct_blocks(car_state *c) {
 static int race_remain_valid(float mm) { return isfinite(mm) && mm >= 0.0f && mm < FLT_MAX; }
 
 static void read_race(car_race *r) {
+  read_junction(r);
   call(f_8983950, 1, P.info_race);
   call(f_8983874, 1, P.info_map);
   call(f_898380c, 1, P.info_sign);
@@ -604,6 +943,7 @@ static void read_race(car_race *r) {
     r->cut_start = ci && M8(ci + 0x50);
     r->cut_lose = ci && M8(ci + 0x51);
     r->ten_line_on = (call(f_8983e5c, 2, P.ten_line, P.ten_line + 12) & 0xffu) && st == 2;
+    r->ten_gap_valid = r->ten_line_on && r->ten_rival >= 0 && r->ten_rival < P.n_ten && isfinite(r->ten_gap);
     memcpy(r->ten_line, VA(P.ten_line), sizeof r->ten_line);
     /* all ten beaten (Goal): SPlayResult +0x14, CState::GetTenFightResult -> CTenSeq::GetResult
      * of the time left: 3 gold, 2 silver, 1 bronze (the workspace's TenResult, the card's) */
@@ -620,12 +960,21 @@ static void read_race(car_race *r) {
     uint32_t m = M32(MACHINE_PTR);
     float odo = m ? MF(m + 0x970u) : 0.0f;
     r->vs_rank = 0;
+    double now = link_now();
     for (int i = 0; i < CAR_RIVALS; ++i) {
       uint32_t lx = M32(LX_RIVALS + 4u * (uint32_t)i);
       r->vs_on[i] = lx && i < P.vs_race;
+      r->vs_fresh[i] = 0;
       if (!r->vs_on[i]) continue;
-      float d = odo - (M8(lx + 8u) ? MF(M32(lx + 0x240u) + 0x30u) : 0.0f);
+      uint32_t packet = M32(lx + 0x240u);
+      int pcb = P.vs[i].pcb;
+      r->vs_pcb[i] = pcb;
+      r->vs_observed[i] = pcb >= 0 && pcb < CAR_LINK_MACHINES ? P.vs_received[pcb] : 0;
+      int on_road = M8(lx + 8u) != 0;
+      float d = odo - (on_road && packet ? MF(packet + 0x30u) : 0.0f);
       r->vs_gap[i] = d * 0.001f;
+      r->vs_fresh[i] = m && on_road && packet && pcb >= 0 && pcb < CAR_LINK_MACHINES &&
+          isfinite(odo) && isfinite(d) && car_link_time_fresh(now, P.vs_received[pcb]);
       if (d < 0.0f) r->vs_rank++;
     }
   }
@@ -644,17 +993,24 @@ static void read_race(car_race *r) {
     memcpy(r->title_log, VA(P.title_log), CAR_TITLE_LOG);
     r->title_log_on = 1;
   }
+  /* Get2DInfoStory can leave individual output slots unwritten. Mark them
+   * before each call so an old gap cannot masquerade as a current leader. */
+  memset(r->story_gap_valid, 0, sizeof r->story_gap_valid);
   if (P.has_rival) {
     /* S2DInfoStory +0: mm (a float) the rival is behind (negative: ahead). At the end (states 3
      * Defeat, 6 TimeUp, 8 Goal) SPlayResult has the player's place by the odometers
      * (CState::Prep_Goal's ranking, 0 first) at +0 and whether the goal was reached at +0x10. */
+    for (int i = 0; i < 3; ++i) WF(P.info_story + 4 * i, NAN);
     call(f_898287c, 1, P.info_story);
-    r->gap = MF(P.info_story) * 0.001f;
-    /* +4 a rival i's, +0xc + i whether it is there (CSeq: its car on the road and not out) */
+    /* +4*i is gap; +0xc+i is the independent picture-enable flag. Keep the
+     * previous display gap when unwritten, but do not mark it valid for rank. */
     for (int i = 0; i < 3; ++i) {
-      r->story_gap[i] = MF(P.info_story + 4 * i) * 0.001f;
+      float mm = MF(P.info_story + 4 * i);
+      r->story_gap_valid[i] = isfinite(mm);
+      if (r->story_gap_valid[i]) r->story_gap[i] = mm * 0.001f;
       r->story_on[i] = M8(P.info_story + 0xc + i);
     }
+    r->gap = r->story_gap[0];
     /* clRaceThread::finiStory: won = rank 0 && !TimeUp && !Retire. GetPlayResult only fills
      * the result for 3/6/8 (mask 0x148); on 10 (Suspend: the episode's distance run without a
      * Defeat) the workspace keeps initRace's rank 0, so surviving the distance is a win. */
@@ -733,8 +1089,12 @@ static uint32_t movie;
 
 float car_movie_start(car_state *c, int id, const car_spec *player, const car_rival *rivals, int n) {
   P.ready = 0;
+  story_carry.loaded = 0; /* a pre-movie Init is not the final race */
   movie = 0;
-  if (rc_load_image(P.image) != 0) return 0;
+  if (rc_load_image(P.image) != 0) {
+    car_story_carry_cancel();
+    return 0;
+  }
   rc_reset_heap();
   P.spec = player ? *player : CAR_SPEC_FD3S;
   car_set_rivals(rivals, n);
@@ -869,6 +1229,22 @@ void car_set_manual(car_state *c, int manual) {
 
 float car_kmh(const car_state *c) { return fabsf(c->speed) * 3.6f; }
 
+/* CInfoSEMc events are sampled at physics rate, not rendering rate. */
+static void read_se(car_se *out) {
+  uint32_t se = P.m + 0xb88u;
+  if (M8(se + 0xa8u)) {
+    out->valb = 1;
+    out->valb_vol = MF(se + 0xacu);
+  }
+  int backfire = M8(se + 0xb0u) != 0;
+  if (backfire && !P.se_backfire_on) {
+    out->backfire = 1;
+    out->backfire_vol = MF(se + 0xb4u);
+    out->backfire_hz = (float)(int32_t)M32(se + 0xb8u);
+  }
+  P.se_backfire_on = backfire;
+}
+
 void car_update(car_state *c, const car_input *in) {
   if (!P.ready) return;
   /* digital buttons: the arcade expects a wheel, so stand in for the driver's hands.
@@ -903,6 +1279,7 @@ void car_update(car_state *c, const car_input *in) {
   /* the arcade frame: the traffic's AI and life, the car, what everything hit, the
    * checkpoints and the time, the sounds' cues */
   call(f_8983f64, 1, P.gin_ptr);
+  read_se(&c->se);
   c->rev_lamp_frame = (int32_t)M32(0x9802828u); /* CSeq::nCnt, observation only */
 
   float prev[3] = { c->pos[0], c->pos[1], c->pos[2] };
